@@ -13,6 +13,9 @@
 // @grant        GM_deleteValue
 // @grant        GM_info
 // @connect      api.torn.com
+// @updateURL   https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
+// @downloadURL https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
+// @source      https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
 // ==/UserScript==
 
 (function(factory) {
