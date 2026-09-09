@@ -300,9 +300,9 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.match(source, /Detected runtime/);
 });
 
-function fixtureRuntime(responder) {
+function fixtureRuntime(responder, persisted = {}) {
     let now = Date.parse("2026-09-10T11:10:00Z");
-    const calls = [], waits = [], saved = {};
+    const calls = [], waits = [], timers = [], saved = structuredClone(persisted);
     class Clock extends Date {
         constructor(...args) { super(...(args.length ? args : [now])); }
         static now() { return now; }
@@ -316,6 +316,8 @@ function fixtureRuntime(responder) {
                 waits.push(ms);
                 now += ms;
                 queueMicrotask(callback);
+            } else {
+                timers.push({ callback, ms });
             }
             return 1;
         },
@@ -335,8 +337,96 @@ function fixtureRuntime(responder) {
     vm.runInNewContext(source, context);
     const hooks = context.module.exports.hooks;
     hooks.runtime.apiKey = "fixture-key";
-    return { ...hooks, calls, waits, saved, setNow(value) { now = Date.parse(value); } };
+    return { ...hooks, calls, waits, timers, saved, setNow(value) { now = Date.parse(value); } };
 }
+
+test("automatic refresh uses completion age, including the exact 30-minute boundary", () => {
+    const completedAt = Date.parse("2026-09-10T11:05:00Z");
+    const snapshot = { slot: Date.parse("2026-09-10T10:10:00Z"), completedAt };
+    const config = { lastCheckedSlot: snapshot.slot, lastCheckedFactionIds: "" };
+    assert.equal(api.automaticRefreshDue(snapshot, config, completedAt + 5 * 60000), false);
+    assert.equal(api.automaticRefreshDue(snapshot, config, completedAt + 30 * 60000), false);
+    assert.equal(api.automaticRefreshDue(snapshot, config, completedAt + 30 * 60000 + 1), true);
+    assert.equal(api.automaticRefreshDue(null, {}, completedAt), true);
+    assert.equal(api.automaticRefreshDue({ completedAt: "invalid" }, {}, completedAt), true);
+    assert.equal(api.automaticRefreshDue(null, { lastSuccessfulUpdateAt: completedAt }, completedAt + 60000), false);
+});
+
+test("reloads reuse persistent updates while manual Refresh bypasses the freshness guard", async () => {
+    let failure = false;
+    const responder = (endpoint) => {
+        if (endpoint === "/user/basic") return { profile: { id: 1, name: "Owner" } };
+        if (endpoint === "/user/competition") return failure ? { error: { code: 16 } }
+            : { competition: { name: "Elimination", team_id: 7, team: "Seven", score: 5, attacks: 2 } };
+        if (endpoint === "/faction/basic") return { basic: { id: 10, name: "Main" } };
+        if (endpoint === "/faction/members") return { members: [rosterMember(1, "Owner")] };
+        if (endpoint === "/faction/44817/basic") return { basic: { id: 44817, name: "Sister" } };
+        if (endpoint === "/faction/44817/members") return { members: [] };
+        if (endpoint === "/torn/elimination") return { elimination: [{ id: 7, name: "Seven", lives: 10 }] };
+        assert.fail("Unexpected endpoint: " + endpoint);
+    };
+    const first = fixtureRuntime(responder);
+    first.setNow("2026-09-10T11:25:00Z");
+    assert.equal(await first.catchUpRefresh("catch-up"), true);
+    const initialCalls = first.calls.length;
+    assert.equal(await first.refreshData("manual"), true);
+    assert.ok(first.calls.length > initialCalls, "Manual refresh must work immediately after an automatic update");
+    const completedAt = first.runtime.snapshot.completedAt;
+    first.saved.TEFR_V1_API_KEY = "fixture-key";
+
+    const reload = fixtureRuntime(responder, first.saved);
+    await reload.loadPersistentState();
+    // Reproduces old-slot and alliance-setting mismatches without an old completion time.
+    reload.runtime.snapshot.slot -= 3600000;
+    reload.runtime.config.lastCheckedFactionIds = "";
+    reload.setNow(new Date(completedAt + 10 * 60000).toISOString());
+    assert.equal(await reload.catchUpRefresh("catch-up"), false);
+    assert.equal(await reload.catchUpRefresh("resume"), false);
+    assert.equal(reload.calls.length, 0);
+    assert.match(reload.runtime.status, /Using cached update/);
+    reload.setNow(new Date(completedAt + 30 * 60000).toISOString());
+    assert.equal(await reload.catchUpRefresh("resume"), false);
+    assert.equal(await reload.refreshData("scheduled"), false);
+    assert.equal(reload.calls.length, 0);
+    assert.equal(reload.timers.length, 1, "A skipped scheduled update must still schedule the next HH:10 check");
+
+    reload.runtime.config.lastCheckedFactionIds = reload.runtime.config.alliedFactionIds.join(",");
+    reload.setNow(new Date(completedAt + 30 * 60000 + 1).toISOString());
+    assert.equal(await reload.catchUpRefresh("resume"), true);
+    assert.ok(reload.calls.length > 0, "Stale data must refresh even in an already recorded hourly slot");
+    assert.equal(reload.runtime.history.points.length, 1, "Same-slot refreshes replace the snapshot");
+    const latest = reload.runtime.snapshot.completedAt;
+    const again = fixtureRuntime(responder, reload.saved);
+    await again.loadPersistentState();
+    again.setNow(new Date(latest + 1000).toISOString());
+    assert.equal(await again.catchUpRefresh("catch-up"), false);
+    assert.equal(again.calls.length, 0);
+    assert.equal(await again.refreshData("manual"), true);
+    assert.ok(again.calls.length > 0);
+    const successfulAt = again.runtime.snapshot.completedAt;
+    failure = true;
+    assert.equal(await again.refreshData("manual"), false);
+    assert.equal(again.runtime.config.lastSuccessfulUpdateAt, successfulAt,
+        "Failed refreshes must not renew the cached update timestamp");
+});
+
+test("an inactive-event check is persisted to avoid repeated reload requests", async () => {
+    const first = fixtureRuntime((endpoint) => {
+        if (endpoint === "/user/basic") return { profile: { id: 1 } };
+        if (endpoint === "/user/competition") return { competition: null };
+        if (endpoint === "/faction/members") return { members: [] };
+        if (endpoint === "/faction/basic") return { basic: { id: 10 } };
+        if (endpoint === "/torn/elimination") return { elimination: [] };
+        assert.fail("Unexpected endpoint: " + endpoint);
+    });
+    assert.equal(await first.catchUpRefresh("catch-up"), false);
+    assert.equal(first.calls.length, 5);
+    first.saved.TEFR_V1_API_KEY = "fixture-key";
+    const reload = fixtureRuntime(() => assert.fail("A fresh inactive-event check must not repeat"), first.saved);
+    await reload.loadPersistentState();
+    assert.equal(await reload.catchUpRefresh("catch-up"), false);
+    assert.equal(reload.calls.length, 0);
+});
 
 test("refresh integrates alliance rosters, pacing, late enrollment, and retained final records", async () => {
     let closed = false, rosterFailure = false;

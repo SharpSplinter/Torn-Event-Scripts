@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.3.1
+// @version      1.3.2
 // @description  Compact hourly Elimination rankings for every faction member. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -26,7 +26,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.3.1";
+    const VERSION = "1.3.2";
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "_###PDA-APIKEY###_";
     const ROOT_ID = "tefr-root";
@@ -35,6 +35,7 @@
     const REQUEST_GAP_MS = 1200;
     const MEMBER_CHUNK_SIZE = 10;
     const MEMBER_CHUNK_PAUSE_MS = 10000;
+    const AUTO_REFRESH_STALE_MS = 30 * 60 * 1000;
     const MAX_HISTORY_POINTS = 1200;
     const STORAGE = {
         key: "TEFR_V1_API_KEY", config: "TEFR_V1_CONFIG",
@@ -44,7 +45,8 @@
         collapsed: false, tab: "overview", search: "", team: "all", faction: "all", rankScope: "alliance",
         alliedFactionIds: [44817],
         participation: "all", showNonParticipants: false, sort: "rank", metric: "score",
-        range: "168", trendMember: "", lastCheckedSlot: 0, lastCheckedFactionIds: ""
+        range: "168", trendMember: "", lastCheckedSlot: 0, lastCheckedFactionIds: "",
+        lastSuccessfulUpdateAt: 0
     };
     const COLORS = [
         "#55ddb8", "#69aef7", "#f6c85f", "#f28e8e", "#b99cff", "#73d2de",
@@ -663,8 +665,33 @@
         }, availability, number(previous.competitionCheckedAt));
     }
 
+    function lastSuccessfulUpdateAt(snapshot, config) {
+        return Math.max(number(snapshot?.completedAt), number(config?.lastSuccessfulUpdateAt));
+    }
+
+    function automaticRefreshDue(snapshot, config, now = Date.now()) {
+        const completedAt = lastSuccessfulUpdateAt(snapshot, config);
+        return completedAt <= 0 || now - completedAt > AUTO_REFRESH_STALE_MS;
+    }
+
+    function showCachedUpdate(reason) {
+        const completedAt = lastSuccessfulUpdateAt(runtime.snapshot, runtime.config);
+        runtime.status = (runtime.snapshot ? "Using cached update from " : "Last API check: ")
+            + formatUtc(completedAt) + " · next scheduled check " + formatUtc(nextSlot(Date.now())) + ".";
+        infoLog("Automatic refresh skipped: cache is fresh", {
+            reason, completedAt: formatUtc(completedAt),
+            ageSeconds: Math.max(0, Math.floor((Date.now() - completedAt) / 1000))
+        });
+        render();
+    }
+
     async function refreshData(reason = "scheduled", slot = slotAtOrBefore(Date.now())) {
         if (runtime.busy) return false;
+        if (reason !== "manual" && !automaticRefreshDue(runtime.snapshot, runtime.config)) {
+            showCachedUpdate(reason);
+            if (reason === "scheduled") scheduleNextRefresh();
+            return false;
+        }
         const key = runtime.injectedKey || runtime.apiKey;
         if (!key) {
             runtime.error = "Enter a Public-access Torn key in Settings.";
@@ -707,6 +734,7 @@
             if (!eventActive) {
                 runtime.config.lastCheckedSlot = slot;
                 runtime.config.lastCheckedFactionIds = alliedIds.join(",");
+                runtime.config.lastSuccessfulUpdateAt = Date.now();
                 runtime.status = "Elimination is not currently active.";
                 await saveConfig();
                 return false;
@@ -826,6 +854,7 @@
             runtime.history = upsertHistory(runtime.history, keyForEvent, buildHistoryPoint(snapshot));
             runtime.config.lastCheckedSlot = slot;
             runtime.config.lastCheckedFactionIds = alliedIds.join(",");
+            runtime.config.lastSuccessfulUpdateAt = snapshot.completedAt;
             runtime.retryNotBefore = 0;
             runtime.status = "Updated for the " + formatUtc(slot) + " interval.";
             const dataWarning = failedMembers
@@ -1310,9 +1339,14 @@
             + "<span><small>Final nonparticipant records</small><b>"
             + formatNumber(runtime.snapshot?.retainedMembers || 0) + "</b></span>"
             + "<span><small>Last completed slot</small><b>" + formatUtc(runtime.snapshot?.slot) + "</b></span>"
-            + "<span><small>Next scheduled update</small><b data-role=\"next-slot\">"
+            + "<span><small>Last successful update</small><b>"
+            + formatUtc(lastSuccessfulUpdateAt(runtime.snapshot, runtime.config)) + "</b></span>"
+            + "<span><small>Automatic refresh</small><b>Only when more than 30 minutes stale</b></span>"
+            + "<span><small>Next scheduled check</small><b data-role=\"next-slot\">"
             + formatUtc(nextSlot(Date.now())) + "</b></span><span><small>Saved hourly updates</small><b>"
             + formatNumber(runtime.history?.points?.length || 0) + "</b></span></div>"
+            + '<p>Page loads, resumes, and HH:10 UTC checks reuse updates up to 30 minutes old. '
+            + 'Manual Refresh and Save &amp; refresh always bypass this limit.</p>'
             + '<p>Hidden members remain in every snapshot. They are checked hourly through enrollment '
             + 'and once more after it closes. Confirmed nonparticipants then use their saved event data; '
             + 'new members and failed checks stay in the update queue. Refresh manually to recheck everyone.</p>'
@@ -1505,7 +1539,7 @@
             input.value = "";
             runtime.error = "";
             render();
-            void catchUpRefresh("key setup");
+            void refreshData("manual", slotAtOrBefore(Date.now()));
         });
         runtime.root.querySelector("[data-action='clear-key']")?.addEventListener("click", async () => {
             runtime.apiKey = "";
@@ -1539,16 +1573,18 @@
     }
 
     async function catchUpRefresh(reason = "resume") {
-        const target = slotAtOrBefore(Date.now());
-        const latest = Math.max(number(runtime.snapshot?.slot), number(runtime.config.lastCheckedSlot));
-        const scopeChanged = runtime.config.lastCheckedFactionIds !== runtime.config.alliedFactionIds.join(",");
-        if ((runtime.injectedKey || runtime.apiKey) && (latest < target || scopeChanged)
-            && !runtime.busy && Date.now() >= runtime.retryNotBefore) {
-            infoLog("Catch-up refresh required", {
-                reason, target: formatUtc(target), latest: formatUtc(latest)
-            });
-            await refreshData(reason, target);
+        if (!(runtime.injectedKey || runtime.apiKey) || runtime.busy
+            || Date.now() < runtime.retryNotBefore) return false;
+        if (!automaticRefreshDue(runtime.snapshot, runtime.config)) {
+            showCachedUpdate(reason);
+            return false;
         }
+        const target = slotAtOrBefore(Date.now());
+        infoLog("Catch-up refresh required: cache is stale or missing", {
+            reason, target: formatUtc(target),
+            completedAt: formatUtc(lastSuccessfulUpdateAt(runtime.snapshot, runtime.config))
+        });
+        return refreshData(reason, target);
     }
 
     const STYLE = `
@@ -1646,6 +1682,7 @@
 
     return {
         VERSION, REQUEST_GAP_MS, MEMBER_CHUNK_SIZE, MEMBER_CHUNK_PAUSE_MS, ENROLLMENT_END_MS,
+        AUTO_REFRESH_STALE_MS, lastSuccessfulUpdateAt, automaticRefreshDue,
         ordinal, slotAtOrBefore, nextSlot,
         normalizeCompetition, normalizeMember, memberPerformanceCompare,
         memberNeedsRefresh, priorMember, visibleMembers, withNonParticipantVisibility,
