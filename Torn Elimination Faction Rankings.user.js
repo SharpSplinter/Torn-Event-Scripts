@@ -28,7 +28,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.4.5";
+    const VERSION = "1.4.6";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
