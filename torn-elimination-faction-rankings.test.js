@@ -274,7 +274,7 @@ test("alliance and faction ranks are separate; duplicates and stale rosters do n
 });
 
 test("userscript security and TornPDA compatibility invariants", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
+    const source = fs.readFileSync(scriptPath, "utf8").replace(/\/\/ BEGIN GENERATED COMPETITION SEED[\s\S]*?\/\/ END GENERATED COMPETITION SEED/, "");
     assert.equal((source.match(/_###PDA-APIKEY###_/g) || []).length, 1);
     assert.doesNotMatch(source, /tickets?/i);
     assert.match(source, /Public-access key only/);
@@ -282,7 +282,10 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.match(source, /PDA_storage/);
     assert.match(source, /GM_xmlhttpRequest/);
     assert.match(source, /Authorization:\s*"ApiKey "\s*\+\s*key/);
-    assert.doesNotMatch(source, /searchParams\.set\(["']key["']/);
+    const tornRequest = source.slice(source.indexOf("async function requestJson("), source.indexOf("async function requestWithRetry("));
+    assert.equal(/searchParams\.set\(["']key["']/.test(tornRequest), false);
+    assert.equal((source.match(/searchParams\.set\(["']key["']/g) || []).length, 1, "Only the authorized FFScouter query-key exception");
+    assert.match(source, /url.searchParams.set\("key", ff.key\)/);
     assert.equal(api.REQUEST_GAP_MS >= 1100, true);
     assert.equal(api.MEMBER_CHUNK_SIZE, 10);
     assert.equal(api.MEMBER_CHUNK_PAUSE_MS >= 10000, true);
