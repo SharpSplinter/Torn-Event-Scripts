@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.4.5
+// @version      1.4.6
 // @description  Compact hourly Elimination rankings for every faction member. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
