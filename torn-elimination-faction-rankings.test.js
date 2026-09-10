@@ -291,7 +291,11 @@ test("alliance and faction ranks are separate; duplicates and stale rosters do n
 
 test("userscript security and TornPDA compatibility invariants", () => {
     const source = fs.readFileSync(scriptPath, "utf8").replace(/\/\/ BEGIN GENERATED COMPETITION SEED[\s\S]*?\/\/ END GENERATED COMPETITION SEED/, "");
-    assert.equal((source.match(/_###PDA-APIKEY###_/g) || []).length, 1);
+    // TornPDA does a literal text substitution of exactly "###PDA-APIKEY###"
+    // wherever it appears in the source. Any extra characters immediately
+    // touching the placeholder (e.g. wrapping underscores) would survive the
+    // substitution and get baked into the injected key, making it invalid.
+    assert.equal((source.match(/PDA_KEY_RAW = "###PDA-APIKEY###";/g) || []).length, 1);
     assert.doesNotMatch(source, /tickets?/i);
     assert.match(source, /Public-access key only/);
     assert.match(source, /PDA_httpGet/);
@@ -311,7 +315,13 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.match(source, /:scope > \.ui-tabs-panel/);
     assert.match(source, /host\.insertBefore\(root, before\)/);
     assert.match(source, /align-self:flex-start/);
-    assert.match(source, /max-height:min\(72vh,780px\)/);
+    assert.ok(source.includes("#tefr-root{display:flex;flex-direction:column;max-height:min(70vh,700px)}"));
+    assert.ok(source.includes("@supports(height:100dvh){#tefr-root{max-height:min(70dvh,700px)}}"));
+    assert.ok(source.includes("#tefr-root .tefr-view{flex:0 1 auto;min-height:0;max-height:none;overflow-y:auto"));
+    assert.ok(source.includes("overscroll-behavior-y:contain"));
+    assert.ok(source.includes("-webkit-overflow-scrolling:touch"));
+    assert.ok(source.includes('#tefr-root.is-collapsed>.tefr-body{display:none}'));
+    assert.ok(source.includes('tabindex="0" aria-label="Scrollable dashboard content"'));
     assert.doesNotMatch(source, /const host = doc\.querySelector\("#mainContainer"\)/);
     assert.match(source, /\[TEFR\]/);
     assert.match(source, /tefr-spinner/);
@@ -351,13 +361,41 @@ function fixtureRuntime(responder, persisted = {}) {
     };
     const source = fs.readFileSync(scriptPath, "utf8").replace(
         "        VERSION, REQUEST_GAP_MS,",
-        "        hooks: { runtime, render, refreshData, loadPersistentState, catchUpRefresh, STYLE },\n        VERSION, REQUEST_GAP_MS,"
+        "        hooks: { runtime, render, refreshData, loadPersistentState, catchUpRefresh, activeApiKey, settingsView, STYLE },\n        VERSION, REQUEST_GAP_MS,"
     );
     vm.runInNewContext(source, context);
     const hooks = context.module.exports.hooks;
     hooks.runtime.apiKey = "fixture-key";
     return { ...hooks, calls, waits, timers, saved, setNow(value) { now = Date.parse(value); } };
 }
+
+test("a manually saved key is always available as a backup and overrides an injected key", () => {
+    const fixture = fixtureRuntime(() => { throw new Error("unused"); });
+    const { runtime } = fixture;
+    runtime.apiKey = "";
+    runtime.injectedKey = "";
+    assert.equal(fixture.activeApiKey(), "");
+    runtime.injectedKey = "injected-key";
+    assert.equal(fixture.activeApiKey(), "injected-key",
+        "Falls back to the TornPDA-injected key when no manual key is saved");
+    runtime.apiKey = "manual-key";
+    assert.equal(fixture.activeApiKey(), "manual-key",
+        "A manually saved key overrides the injected key as a backup/redundancy path");
+    runtime.root = {
+        innerHTML: "", className: "", addEventListener() {},
+        ownerDocument: { addEventListener() {} },
+        querySelector: () => null, querySelectorAll: () => []
+    };
+    runtime.config.tab = "settings";
+    fixture.render();
+    assert.match(runtime.root.innerHTML, /data-role="api-key"/,
+        "The manual key field must remain visible even when a key is injected");
+    assert.match(runtime.root.innerHTML, /backup \/ override/);
+    runtime.apiKey = "";
+    fixture.render();
+    assert.match(runtime.root.innerHTML, /data-role="api-key"/,
+        "The manual key field is also available when relying solely on the injected key");
+});
 
 test("automatic refresh uses completion age, including the exact 30-minute boundary", () => {
     const completedAt = Date.parse("2026-09-10T11:05:00Z");

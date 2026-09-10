@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.4.3
+// @version      1.4.5
 // @description  Compact hourly Elimination rankings for every faction member. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -28,10 +28,10 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.4.3";
+    const VERSION = "1.4.5";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
-    const PDA_KEY_RAW = "_###PDA-APIKEY###_";
+    const PDA_KEY_RAW = "###PDA-APIKEY###";
     const ROOT_ID = "tefr-root";
     const NOT_PARTICIPATING = "Not Participating";
     const ENROLLMENT_END_MS = Date.UTC(2026, 8, 10, 12);
@@ -456,6 +456,13 @@
         return value && !value.includes("PDA-APIKEY") ? value : "";
     }
 
+    // A manually saved key is treated as a deliberate override/backup: if the
+    // person has entered one (e.g. because TornPDA's injected key stopped
+    // working), it takes priority over whatever TornPDA supplied.
+    function activeApiKey() {
+        return runtime.apiKey || runtime.injectedKey;
+    }
+
     function nativeStore() {
         return typeof PDA_storage !== "undefined" && PDA_storage?.loadAll
             ? PDA_storage : null;
@@ -533,7 +540,9 @@
             runtime.history = { eventKey: "", points: [] };
         }
         runtime.injectedKey = injectedKey();
-        runtime.apiKey = runtime.injectedKey || await legacyGet(STORAGE.key, "");
+        // Load the manually saved key independently of the injected one so a
+        // saved backup key always survives and can override a broken injection.
+        runtime.apiKey = await legacyGet(STORAGE.key, "");
     }
 
     async function persistValues(values) {
@@ -716,7 +725,7 @@
             if (reason === "scheduled") scheduleNextRefresh();
             return false;
         }
-        const key = runtime.injectedKey || runtime.apiKey;
+        const key = activeApiKey();
         if (!key) {
             runtime.error = "Enter a Public-access Torn key in Settings.";
             runtime.config.tab = "settings";
@@ -1357,14 +1366,21 @@
                 + '</b><small>' + faction.memberCount + ' members'
                 + (faction.rosterAvailable ? "" : ' · Roster unavailable') + '</small></span>'
             ).join("") + '</div></section>';
-        const keySetup = runtime.injectedKey
-            ? '<div class="tefr-notice good">TornPDA supplied the Public-access key securely.</div>'
-            : '<div class="tefr-key-row"><label><span>Public-access Torn API key</span>'
-                + '<input data-role="api-key" type="password" autocomplete="off" spellcheck="false" '
-                + 'placeholder="' + (runtime.apiKey ? "Stored key — enter a replacement" : "Paste key") + '"></label>'
-                + '<button type="button" data-action="save-key">Save key</button>'
-                + (runtime.apiKey ? '<button type="button" class="danger" data-action="clear-key">Clear key</button>' : "")
-                + "</div>";
+        const keyNotice = runtime.injectedKey
+            ? '<div class="tefr-notice ' + (runtime.apiKey ? "warn" : "good") + '">'
+                + "TornPDA supplied the Public-access key securely."
+                + (runtime.apiKey
+                    ? " A manually saved key is also stored below and is currently used instead, as an override/backup."
+                    : " You can also save a manual key below as a backup in case the injected key ever stops working.")
+                + "</div>"
+            : "";
+        const keySetup = keyNotice + '<div class="tefr-key-row"><label><span>Public-access Torn API key'
+            + (runtime.injectedKey ? " (backup / override)" : "") + '</span>'
+            + '<input data-role="api-key" type="password" autocomplete="off" spellcheck="false" '
+            + 'placeholder="' + (runtime.apiKey ? "Stored key — enter a replacement" : "Paste key") + '"></label>'
+            + '<button type="button" data-action="save-key">Save key</button>'
+            + (runtime.apiKey ? '<button type="button" class="danger" data-action="clear-key">Clear key</button>' : "")
+            + "</div>";
         return '<div class="tefr-settings"><section class="tefr-panel"><h3>API access</h3>'
             + '<div class="tefr-public"><b>Public-access Torn key only</b>'
             + "<span>Limited or Full access is unnecessary.</span></div>" + keySetup
@@ -1468,10 +1484,11 @@
             + '<nav class="tefr-tabs" aria-label="Elimination dashboard views">'
             + tabs.map(([id, label]) => '<button type="button" data-tab="' + id + '"'
                 + (runtime.config.tab === id ? ' class="active" aria-current="page"' : "")
-            + ">" + label + "</button>").join("") + "</nav>" + (runtime.config.tab === "competition" ? "" : visibilityControl())
+            + ">" + label + "</button>").join("") + '</nav><main class="tefr-view" tabindex="0" aria-label="Scrollable dashboard content">'
+            + (runtime.config.tab === "competition" ? "" : visibilityControl())
             + (runtime.error ? '<div class="tefr-notice error">' + escapeHtml(runtime.error) + "</div>" : "")
             + (runtime.warning ? '<div class="tefr-notice warn">' + escapeHtml(runtime.warning) + "</div>" : "")
-            + '<main class="tefr-view">' + currentView() + "</main></div>";
+            + currentView() + "</main></div>";
         bindEvents();
         applyMemberFilters();
         updateNextSlotText();
@@ -1617,7 +1634,7 @@
     }
 
     async function catchUpRefresh(reason = "resume") {
-        if (!(runtime.injectedKey || runtime.apiKey) || runtime.busy
+        if (!activeApiKey() || runtime.busy
             || Date.now() < runtime.retryNotBefore) return false;
         if (!automaticRefreshDue(runtime.snapshot, runtime.config)) {
             showCachedUpdate(reason);
@@ -1646,7 +1663,13 @@
 .tefr-team-groups{display:grid;gap:8px}.tefr-team-group{border-top:3px solid var(--team);padding:7px}.tefr-team-group>header{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px}.tefr-team-group>header>div{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.tefr-team-group .tefr-team-dot{background:var(--team);margin:0}.tefr-team-group header small{color:var(--muted)}.tefr-team-group>header>div:last-child b{background:var(--panel2);padding:3px 6px;border-radius:4px}.tefr-chart{width:100%;overflow:hidden}.tefr-chart svg{display:block;width:100%;max-height:280px}.tefr-legend{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:5px}.tefr-legend span{font-size:10px;color:var(--muted)}.tefr-legend i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}.tefr-chart-note{color:var(--muted);font-size:10px;text-align:center}
 .tefr-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tefr-settings .tefr-panel{margin:0}.tefr-settings .tefr-panel:last-child{grid-column:1/-1}.tefr-public{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}.tefr-public span,.tefr-settings p{color:var(--muted)}.tefr-key-row{display:grid;grid-template-columns:minmax(160px,1fr) auto auto;gap:6px;align-items:end}.tefr-root button.danger{border-color:#7c4545;color:#ffabab}.tefr-settings code{display:inline-block;background:#0e1920;color:#b9d6e5;padding:4px 6px;margin:2px;border-radius:4px;overflow-wrap:anywhere}
 .tefr-root button[aria-pressed="true"]{background:var(--accent);color:#092019;font-weight:800}.tefr-result-count button{max-width:100%;white-space:normal;overflow-wrap:anywhere}.tefr-settings-grid b{overflow-wrap:anywhere}.tefr-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(min-width:701px){.tefr-view{max-height:min(72vh,780px);overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:2px}}
+#tefr-root{display:flex;flex-direction:column;max-height:min(70vh,700px)}
+#tefr-root>.tefr-header{flex:0 0 auto}
+#tefr-root>.tefr-body{display:flex;flex-direction:column;flex:0 1 auto;min-height:0;overflow:hidden}
+#tefr-root .tefr-tabs{flex:0 0 auto}
+#tefr-root .tefr-view{flex:0 1 auto;min-height:0;max-height:none;overflow-y:auto;overflow-x:hidden;overscroll-behavior-y:contain;scrollbar-gutter:stable;-webkit-overflow-scrolling:touch;padding-right:2px}
+#tefr-root.is-collapsed>.tefr-body{display:none}
+@supports(height:100dvh){#tefr-root{max-height:min(70dvh,700px)}}
 @media(max-width:700px){.tefr-header{align-items:flex-start}.tefr-public-badge{width:100%;text-align:center;order:3}.tefr-personal{grid-template-columns:48px repeat(2,1fr)}.tefr-personal-main{grid-column:2/4}.tefr-neighbors,.tefr-personal-chart{grid-column:1/-1}.tefr-team-grid,.tefr-settings{grid-template-columns:1fr}.tefr-settings .tefr-panel:last-child{grid-column:auto}.tefr-toolbar{grid-template-columns:1fr}.tefr-member-card{grid-template-columns:48px minmax(0,1fr)}.tefr-member-metrics{grid-column:1/-1;text-align:center}.tefr-member-card details{grid-column:1/-1}.tefr-stale{position:absolute;right:12px}.tefr-member-card{position:relative}.tefr-details-grid,.tefr-settings-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:430px){#tefr-root{margin-left:0;margin-right:0}.tefr-header{display:grid}.tefr-header-actions{justify-content:flex-start}.tefr-mini-grid{grid-template-columns:repeat(2,1fr)}.tefr-key-row{grid-template-columns:1fr 1fr}.tefr-key-row label{grid-column:1/-1}.tefr-bar-row{grid-template-columns:76px 1fr 52px}.tefr-team-group>header{align-items:flex-start;flex-direction:column}}
 @supports(padding:max(0px)){.tefr-body{padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}}
@@ -1841,7 +1864,7 @@
 
     async function directoryRequest(teamId, offset, scanning = false) {
         if (directory.busy || runtime.busy || !competitionVisible()) return false;
-        const key = runtime.injectedKey || runtime.apiKey;
+        const key = activeApiKey();
         if (!key) { directory.notice = "A Public-access Torn key is needed for the official roster."; return false; }
         directory.busy = true;
         const generation = directory.generation;
@@ -2006,7 +2029,7 @@
         if (key && !/^[a-zA-Z0-9]{16}$/.test(key)) {
             ff.notice = "Enter a 16-character FFScouter key."; return false;
         }
-        if (key && key === (runtime.injectedKey || runtime.apiKey)) {
+        if (key && key === activeApiKey()) {
             ff.notice = "Use a separate dedicated FFScouter key, not the rankings key."; return false;
         }
         ff.generation++;
