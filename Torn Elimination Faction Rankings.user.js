@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.4.2
+// @version      1.4.3
 // @description  Compact hourly Elimination rankings for every faction member. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -28,7 +28,8 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.4.2";
+    const VERSION = "1.4.3";
+    const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "_###PDA-APIKEY###_";
     const ROOT_ID = "tefr-root";
@@ -1054,6 +1055,16 @@
         }).join("") + "</div>";
     }
 
+    function eventTeamPlace(member, teams) {
+        if (!member?.participating || isNonParticipatingTeam(member.teamName)) return "-";
+        const eligible = (teams || []).filter(team => !isNonParticipatingTeam(team.name));
+        const team = eligible.find(team => member.teamId != null && team.id === member.teamId)
+            || eligible.find(team => normalizedTeamName(team.name) === normalizedTeamName(member.teamName));
+        const position = team?.position;
+        return (Number.isInteger(position) && position >= 1 && position <= ELIMINATION_TEAM_COUNT
+            ? ordinal(position) : "—") + " / " + ELIMINATION_TEAM_COUNT;
+    }
+
     function personalCard() {
         const snapshot = runtime.snapshot;
         const member = snapshot?.members?.find((row) => row.id === snapshot.profile?.id);
@@ -1090,10 +1101,12 @@
             + (member.sourceFactionSize || snapshot.members.length)
             + ' · Alliance Rank: ' + ordinal(member.allianceRank ?? member.factionRank)
             + ' / ' + snapshot.members.length + '</small>'
+            + (member.teamRank ? '<small>Among tracked teammates: ' + ordinal(member.teamRank)
+                + ' / ' + teamTotal + '</small>' : "")
             + '</div><div class="tefr-stat"><small>Score</small><b>' + formatNumber(member.score)
             + '</b></div><div class="tefr-stat"><small>Attacks</small><b>' + formatNumber(member.attacks)
-            + '</b></div><div class="tefr-stat"><small>Team place</small><b>'
-            + (member.teamRank ? ordinal(member.teamRank) + " / " + teamTotal : "-")
+            + '</b></div><div class="tefr-stat" title="Global event standing among all 12 Elimination teams"><small>Team place (global)</small><b>'
+            + eventTeamPlace(member, snapshot.teams)
             + '</b></div><div class="tefr-stat"><small>Movement</small><b class="'
             + movement.tone + '">' + movement.label + '</b></div><div class="tefr-neighbors">'
             + neighbor("Member above", above, true) + neighbor("Member below", below, false)
@@ -2693,7 +2706,7 @@
         parseFactionIds, normalizeFaction, factionLabel, mergeFactionRosters,
         pointRank,
         normalizedTeamName, isNonParticipatingTeam, teamKey, resolveMemberTeams,
-        rankMembers, normalizeGlobalTeam, aggregateTeams, eventKey,
+        rankMembers, normalizeGlobalTeam, aggregateTeams, eventKey, eventTeamPlace,
         buildHistoryPoint, upsertHistory, previousHistoryPoint,
         safeApiMessage, detectedRuntime, bootstrap
     };

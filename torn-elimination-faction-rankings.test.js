@@ -9,6 +9,22 @@ const vm = require("node:vm");
 const scriptPath = path.join(__dirname, "Torn Elimination Faction Rankings.user.js");
 const api = require(scriptPath);
 
+test("personal Team place uses the global event position out of 12, not tracked-player count", () => {
+    const member = { participating: true, teamId: 84, teamName: "Rocket Scientists", teamRank: 7 };
+    const teams = [
+        { id: 84, name: "Rocket Scientists", position: 3, factionMembers: 9 },
+        { id: null, name: "Not Participating", position: 1 }
+    ];
+    assert.equal(api.eventTeamPlace(member, teams), "3rd / 12");
+    assert.equal(api.eventTeamPlace({ ...member, teamId: null }, teams), "3rd / 12");
+    assert.equal(api.eventTeamPlace(member, [{ ...teams[0], position: 12, eliminated: true }]), "12th / 12");
+    assert.equal(api.eventTeamPlace(member, []), "— / 12");
+    assert.equal(api.eventTeamPlace(member, [{ ...teams[0], position: 999 }]), "— / 12");
+    assert.equal(api.eventTeamPlace({ participating: false, teamName: "Not Participating" }, teams), "-");
+    const full = Array.from({ length: 12 }, (_, i) => ({ id: 79 + i, name: i === 5 ? "Rocket Scientists" : "Team " + i, position: i + 1 }));
+    assert.equal(api.eventTeamPlace(member, [...full, teams[1]]), "6th / 12");
+});
+
 function rosterMember(id, name) {
     return {
         id, name, position: "Member", level: 50, days_in_faction: 100,
