@@ -33,7 +33,7 @@ function fixture(responder = () => [], saved = {}) {
         }
     };
     const source = fs.readFileSync(file, "utf8").replace("        VERSION, REQUEST_GAP_MS,",
-        "        hooks: { directory, ff, runtime, loadCompetition, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, STYLE },\n        VERSION, REQUEST_GAP_MS,");
+        "        hooks: { directory, ff, runtime, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
     vm.runInNewContext(source, context);
     const h = context.module.exports.hooks;
     h.runtime.config.tab = "competition";
@@ -234,6 +234,99 @@ test("storage failure keeps in-memory data, pauses scan and preserves faction hi
     assert.ok(Object.keys(f.directory.data.players).length > 0);
 });
 
+test("BS chart labels axes, scales close values and distinguishes sparse samples", () => {
+    const f = fixture();
+    const t = now / 1000;
+    f.ff.cache.history[1] = { points: [
+        { at: t + 86400, value: 13.16e9 },
+        { at: t, value: 13e9 },
+        { at: t + 21600, value: 13.05e9 }
+    ] };
+    const html = f.bsHistoryMarkup(1);
+    assert.ok(html.includes("Date / time (UTC)"));
+    assert.ok(html.includes("BS estimate"));
+    assert.ok(html.includes("13.200B") || html.includes("B</text>"));
+    assert.match(html, /class="tefr-bs-line" d="M[^"]+L/);
+    assert.match(html, /class="tefr-bs-gap" d="M[^"]+L/);
+    assert.ok(html.includes("Gap guide"));
+    assert.ok(html.includes("not necessarily zero"));
+    const ys = [...html.matchAll(/<circle cx="[^"]+" cy="([^"]+)"[^>]+class="tefr-bs-dot"/g)].map(m => +m[1]);
+    assert.equal(ys.length, 3);
+    assert.ok(Math.max(...ys) - Math.min(...ys) > 60);
+    assert.equal(f.ff.cache.history[1].points[0].at, t + 86400);
+});
+
+test("BS chart handles empty, zero, single and flat histories without invalid geometry", () => {
+    const f = fixture();
+    assert.ok(f.bsHistoryMarkup(1).includes("Load up to"));
+    f.ff.cache.history[1] = { points: [{ at: 1, value: null }, { at: NaN, value: 10 }] };
+    assert.ok(f.bsHistoryMarkup(1).includes("No estimate history"));
+    for (const points of [[{ at: 1, value: 0 }], [{ at: 1, value: 10 }, { at: 21601, value: 10 }]]) {
+        f.ff.cache.history[1] = { points };
+        const html = f.bsHistoryMarkup(1);
+        assert.equal(/NaN|Infinity/.test(html), false);
+        assert.equal((html.match(/class="tefr-bs-dot"/g) || []).length, points.length);
+    }
+});
+
+test("explicit missing history buckets are dashed, never drawn as observations", () => {
+    const f = fixture();
+    f.ff.cache.history[1] = { points: [
+        { at: 1, value: 10 }, { at: 10001, value: null }, { at: 21601, value: 20 }
+    ] };
+    const html = f.bsHistoryMarkup(1);
+    assert.ok(html.includes('class="tefr-bs-line" d=""'));
+    assert.match(html, /class="tefr-bs-gap" d="M[^"]+L/);
+    assert.equal((html.match(/class="tefr-bs-dot"/g) || []).length, 2);
+});
+
+test("BS tooltips support touch clicks, mouse hover, keyboard and outside dismissal", () => {
+    const f = fixture(), events = {}, docEvents = {};
+    const tip = { hidden: true, style: {}, offsetWidth: 180, offsetHeight: 44 };
+    const plot = { querySelector: () => tip, getBoundingClientRect: () => ({ left: 0, top: 0, width: 300 }) };
+    const point = {
+        closest: () => plot,
+        setAttribute(key, value) { this[key] = value; },
+        getAttribute: () => "10 Sept, 12:00 UTC\nBS estimate: 13,160,000,000",
+        querySelector: () => ({ getBoundingClientRect: () => ({ left: 280, top: 10, bottom: 16, width: 6 }) })
+    };
+    const target = { closest: () => point };
+    const root = {
+        querySelectorAll: () => [],
+        addEventListener(name, fn) { assert.equal(events[name], undefined); events[name] = fn; },
+        ownerDocument: { addEventListener: (name, fn) => { docEvents[name] = fn; } },
+        contains: () => false
+    };
+    f.bindHistoryTooltips(root);
+    f.bindHistoryTooltips(root);
+    events.pointerover({ pointerType: "touch", target });
+    assert.equal(tip.hidden, true);
+    events.click({ target });
+    assert.equal(tip.hidden, false);
+    assert.ok(tip.textContent.includes("13,160,000,000"));
+    assert.equal(point["aria-pressed"], "true");
+    assert.equal(tip.style.left, "112px");
+    events.pointerout({ pointerType: "mouse", target });
+    assert.equal(tip.hidden, false);
+    events.keydown({ key: "Escape", target });
+    assert.equal(tip.hidden, true);
+    events.pointerover({ pointerType: "mouse", target });
+    assert.equal(tip.hidden, false);
+    events.pointerout({ pointerType: "mouse", target });
+    assert.equal(tip.hidden, true);
+    let prevented = false;
+    events.keydown({ key: "Enter", target, preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+    assert.equal(tip.hidden, false);
+    docEvents.click({ target: {} });
+    assert.equal(tip.hidden, true);
+    f.ff.cache.history[1] = { points: [{ at: 1, value: 5 }] };
+    const html = f.bsHistoryMarkup(1);
+    assert.ok(html.includes('data-bs-point tabindex="0" role="button"'));
+    assert.ok(html.includes('r="14" fill="transparent"'));
+    assert.ok(html.includes('role="tooltip" hidden'));
+});
+
 test("sorting supports both directions and leaves unknown values last", () => {
     const rows = [
         { id: 1, name: "Alpha", level: 1, score: 10, attacks: 2 },
@@ -249,6 +342,54 @@ test("sorting supports both directions and leaves unknown values last", () => {
     assert.deepEqual(api.sortCompetitionPlayers(rows, estimates, "name", "asc").map(p => p.id), [1, 2, 3]);
     assert.deepEqual(api.sortCompetitionPlayers(rows, estimates, "api", "desc").map(p => p.id), [1, 2, 3]);
     assert.deepEqual(rows.map(p => p.id), [1, 2, 3]);
+});
+
+test("status priority overrides every sort field and direction including roster order", () => {
+    const rows = [
+        { id: 1, name: "A", level: 100, score: 100, attacks: 100, status: { state: "Traveling" } },
+        { id: 2, name: "B", level: 50, score: 50, attacks: 50, status: { state: "Hospital" } },
+        { id: 3, name: "Z", level: 1, score: 1, attacks: 1, status: { state: "Okay" } },
+        { id: 4, name: "C", level: 200, score: 200, attacks: 200, status: null },
+        { id: 5, name: "D", level: 150, score: 150, attacks: 150, status: { state: "Jail" } }
+    ];
+    const estimates = Object.fromEntries(rows.map(p => [p.id, { fairFight: p.level, estimate: p.level }]));
+    for (const field of ["api", "name", "level", "score", "attacks", "ff", "bs"])
+        for (const direction of ["asc", "desc"])
+            assert.deepEqual(api.sortCompetitionPlayers(rows, estimates, field, direction).map(p => p.id), [3, 2, 1, 5, 4]);
+    rows.push({ id: 6, name: "E", level: 2, status: { state: "Okay" } });
+    assert.deepEqual(api.sortCompetitionPlayers(rows, estimates, "level", "desc").slice(0, 2).map(p => p.id), [6, 3]);
+    assert.deepEqual(api.sortCompetitionPlayers(rows, estimates, "level", "asc").slice(0, 2).map(p => p.id), [3, 6]);
+    rows[1].status.state = "Hospitalized";
+    assert.equal(api.sortCompetitionPlayers(rows, estimates, "api")[2].id, 2);
+});
+
+test("competition sort defaults to name and persists only valid field and direction", async () => {
+    const f = fixture();
+    assert.equal(f.directory.filters.sort, "name");
+    const markup = f.competitionView();
+    const select = markup.match(/<select data-cp-field="sort">([\s\S]*?)<\/select>/)[1];
+    assert.deepEqual([...select.matchAll(/value="([^"]+)"/g)].map(m => m[1]), ["name", "level", "score", "attacks", "ff", "bs"]);
+    assert.equal(markup.includes("Roster order"), false);
+    await Promise.all([
+        f.saveCompetitionSort({ sort: "ff", direction: "asc" }),
+        f.saveCompetitionSort({ sort: "bs", direction: "desc", key: "must-not-persist" })
+    ]);
+    assert.deepEqual(f.saved.TEFR_V2_COMPETITION_SORT, { sort: "bs", direction: "desc" });
+    const reload = fixture(undefined, f.saved);
+    reload.directory.loaded = false;
+    await reload.loadCompetition();
+    assert.equal(reload.directory.filters.sort, "bs");
+    assert.equal(reload.directory.filters.direction, "desc");
+    const pda = fixture();
+    pda.runtime.nativeValues = { TEFR_V2_COMPETITION_SORT: { sort: "attacks", direction: "desc" } };
+    pda.directory.loaded = false;
+    await pda.loadCompetition();
+    assert.equal(pda.directory.filters.sort, "attacks");
+    const old = fixture(undefined, { TEFR_V2_COMPETITION_SORT: { sort: "api", direction: "invalid" } });
+    old.directory.loaded = false;
+    await old.loadCompetition();
+    assert.equal(old.directory.filters.sort, "name");
+    assert.equal(old.directory.filters.direction, "asc");
 });
 
 test("selected competition subview is explicit and has an accessible visual state", () => {

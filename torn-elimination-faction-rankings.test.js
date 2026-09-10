@@ -497,6 +497,8 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     const buttons = {};
     runtime.root = {
         innerHTML: "", className: "",
+        addEventListener() {},
+        ownerDocument: { addEventListener() {} },
         querySelector(selector) {
             if (selector === "[data-action='toggle-nonparticipants']") return {
                 addEventListener(type, handler) { buttons.visibility = handler; }
