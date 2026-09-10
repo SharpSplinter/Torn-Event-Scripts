@@ -3,13 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 const root = path.dirname(fileURLToPath(import.meta.url));
-const html = String.raw`<!doctype html><meta charset="utf-8"><title>TEFR local UI fixture</title>
+const html = String.raw`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TEFR local UI fixture</title>
 <style>body{margin:0;background:#20252a;color:#ddd;font:14px sans-serif}header.fixture{padding:18px;background:#111}#mainContainer{max-width:1000px;margin:auto}.content-wrapper{padding:12px}#factions{min-width:0}</style>
 <header class="fixture">Torn UI fixture — Actions / Energy / Nerve / Life bars remain above the dashboard</header>
 <div id="mainContainer"><div class="content-wrapper"><div id="factions"><div class="ui-tabs-panel">Faction content fixture</div></div></div></div>
 <script>
 window.GM_getValue=(key,fallback)=>fallback;
 window.GM_setValue=()=>{};
+if(new URLSearchParams(location.search).has("pda")) {
+ const values={};
+ window.PDA_storage={loadAll:async()=>({...values}),get:async(k,f)=>values[k]??f,setMany:async(v)=>Object.assign(values,v)};
+}
 window.GM_xmlhttpRequest=details=>{
  const u=new URL(details.url);
  let data={error:{code:32}};
@@ -24,6 +28,7 @@ window.GM_xmlhttpRequest=details=>{
 </script><script src="/userscript.js"></script><script>
 (async()=>{
  const h=window.fixture;
+ await h.loadPersistentState();
  await h.loadCompetition();
  h.runtime.config.tab="competition";
  h.runtime.status="Local preview — fixture data, no live API requests";
@@ -40,7 +45,7 @@ const server = http.createServer((req,res)=>{
  if(req.url==="/userscript.js"){
   const source=fs.readFileSync(path.join(root,"Torn Elimination Faction Rankings.user.js"),"utf8")
    .replace('if (typeof window !== "undefined" && window.document) void api.bootstrap(window);','window.fixture = api.hooks;')
-   .replace("        VERSION, REQUEST_GAP_MS,","        hooks: { runtime, directory, ff, mount, loadCompetition, refreshVisibleEstimates, updateHospitalTimers, render },\n        VERSION, REQUEST_GAP_MS,");
+   .replace("        VERSION, REQUEST_GAP_MS,","        hooks: { runtime, directory, ff, mount, loadPersistentState, loadCompetition, refreshVisibleEstimates, updateHospitalTimers, render },\n        VERSION, REQUEST_GAP_MS,");
   res.writeHead(200,{"Content-Type":"application/javascript; charset=utf-8"});res.end(source);
  }else{res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});res.end(html);}
 });

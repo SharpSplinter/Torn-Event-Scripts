@@ -33,7 +33,7 @@ function fixture(responder = () => [], saved = {}) {
         }
     };
     const source = fs.readFileSync(file, "utf8").replace("        VERSION, REQUEST_GAP_MS,",
-        "        hooks: { directory, ff, runtime, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
+        "        hooks: { directory, ff, runtime, loadPersistentState, readShared, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
     vm.runInNewContext(source, context);
     const h = context.module.exports.hooks;
     h.runtime.config.tab = "competition";
@@ -41,6 +41,7 @@ function fixture(responder = () => [], saved = {}) {
     h.directory.loaded = true;
     h.directory.data = api.newDirectory([team], now);
     h.directory.team = "90";
+    h.directory.catalog = { year: 2026, updatedAt: now, teams: [team] };
     h.ff.key = "f".repeat(16);
     h.ff.validated = true;
     return { ...h, calls, logs, waits, saved, context, advance(ms) { time += ms; } };
@@ -86,10 +87,66 @@ test("new year excludes old seed; changed event team IDs reset directory only", 
     assert.equal(Object.keys(api.newDirectory([team], Date.UTC(2027, 8, 9)).players).length, 0);
     const f = fixture();
     f.runtime.history = { points: [{ marker: "keep" }] };
+    f.directory.catalog = null;
     f.runtime.snapshot = { globalTeamsAvailable: true, completedAt: now, teams: [{ id: 91, name: "New", participants: 20 }] };
     f.synchronizeDirectoryEvent();
     assert.equal(f.directory.data.eventKey, "2026:91");
     assert.equal(f.runtime.history.points[0].marker, "keep");
+});
+
+test("compact directory survives page reloads and keeps completed scans completed", async () => {
+    const f = fixture(() => page([row(1)]));
+    f.ff.key = "";
+    await f.directoryRequest(90, 0, true);
+    assert.equal(f.directory.data.scan.done, true);
+    assert.equal(f.saved.TEFR_V2_DIRECTORY.schema, 3);
+    assert.equal(f.saved.TEFR_V2_DIRECTORY.players, undefined);
+    const restored = fixture(() => page([row(1)]), f.saved);
+    restored.ff.key = "";
+    restored.directory.loaded = false;
+    await restored.loadCompetition();
+    restored.directory.catalog = { year: 2026, updatedAt: now, teams: [team] };
+    assert.equal(restored.directory.data.scan.done, true);
+    assert.equal(restored.directory.data.players[1].status.state, "Okay");
+    await restored.competitionTick();
+    assert.equal(restored.calls.length, 1, "Reload updates the visible page only");
+    await restored.competitionTick();
+    assert.equal(restored.calls.length, 1, "No recurring full build");
+    restored.advance(60000);
+    await restored.competitionTick();
+    assert.equal(restored.calls.length, 2);
+    assert.ok(restored.calls.every(call => call.path === "/v2/torn/90/eliminationteam" && call.params.offset === "0"));
+});
+
+test("official cursor is independent of standings order and resumes missing pages", () => {
+    const d = api.newDirectory([{ id: 90, name: "B" }, { id: 70, name: "A" }], now);
+    d.players = {};
+    api.acceptRosterPage(d, 70, 0, page([row(1)]), now, true);
+    d.teams.reverse();
+    api.reconcileDirectoryCursor(d);
+    assert.equal(d.teams[d.scan.team].id, 90);
+    api.acceptRosterPage(d, 90, 0, page([row(2)]), now, true);
+    assert.equal(d.scan.done, true);
+    const stored = JSON.parse(JSON.stringify(api.packDirectory(d)));
+    assert.equal(api.unpackDirectory(stored).scan.done, true);
+});
+
+test("full seed persistence is compact enough to leave room for TornPDA history", () => {
+    const d = api.newDirectory(undefined, now);
+    const packed = JSON.stringify(api.packDirectory(d));
+    assert.ok(Buffer.byteLength(packed) < 3 * 1024 * 1024);
+    assert.equal(Object.keys(api.unpackDirectory(JSON.parse(packed)).players).length, 22814);
+});
+
+test("same-event official ID corrections preserve other indexed teams", () => {
+    const f = fixture();
+    f.directory.data = api.newDirectory([{ id: 79, name: "Brain Surgeons" }, team], now);
+    f.directory.data.pages["90:0"] = { ids: [1], next: null, updatedAt: now };
+    f.directory.catalog = { year: 2026, updatedAt: now, teams: [{ id: 70, name: "Brain Surgeons" }, team] };
+    f.synchronizeDirectoryEvent();
+    assert.ok(f.directory.data.pages["90:0"]);
+    assert.equal(f.directory.data.teams[0].id, 70);
+    assert.equal(f.directory.data.scan.offset, 0);
 });
 
 test("hospital timer handles unknown, missing time, expiry and revised discharge", () => {
@@ -232,6 +289,78 @@ test("storage failure keeps in-memory data, pauses scan and preserves faction hi
     assert.equal(f.directory.data.scan.paused, true);
     assert.equal(f.runtime.history.points[0].keep, true);
     assert.ok(Object.keys(f.directory.data.players).length > 0);
+});
+
+test("TornPDA native storage shares the completed index and pending scan across pages", async () => {
+    const saved = {}, legacy = {};
+    const store = {
+        async loadAll() { return structuredClone(saved); },
+        async get(k, fallback) { return structuredClone(saved[k] ?? fallback); },
+        async setMany(values) { Object.assign(saved, structuredClone(values)); }
+    };
+    const first = fixture(() => page([row(1)]), legacy);
+    first.context.PDA_storage = store;
+    await first.loadPersistentState();
+    first.runtime.apiKey = "main-test-key";
+    first.runtime.config.tab = "competition";
+    await first.directoryRequest(90, 0, true);
+    await first.saveExtra("TEFR_V2_PENDING_SCAN", { id: "checkpoint", responses: { "/user/basic": { data: { profile: { id: 1 } } } } });
+    assert.equal(saved.TEFR_V2_DIRECTORY.schema, 3);
+    assert.equal(legacy.TEFR_V2_DIRECTORY, undefined);
+    const second = fixture(() => page([row(1)]), legacy);
+    second.context.PDA_storage = store;
+    await second.loadPersistentState();
+    second.directory.loaded = false;
+    await second.loadCompetition();
+    assert.equal(second.runtime.storageMode, "TornPDA native storage");
+    assert.equal(second.runtime.scan.id, "checkpoint");
+    assert.equal(second.directory.data.scan.done, true);
+    assert.equal(second.directory.data.players[1].status.state, "Okay");
+    saved.TEFR_V2_PENDING_SCAN = null;
+    assert.equal(await second.readShared("TEFR_V2_PENDING_SCAN"), null);
+});
+
+test("native storage failures never fall back or disappear after a lease write", async () => {
+    const f = fixture();
+    f.context.PDA_storage = {
+        async loadAll() { return {}; },
+        async setMany(values) {
+            if ("TEFR_V2_DIRECTORY" in values) throw new Error("quota");
+        }
+    };
+    await f.loadPersistentState();
+    assert.equal(await f.saveExtra("TEFR_V2_DIRECTORY", f.directory.data), false);
+    assert.equal(f.saved.TEFR_V2_DIRECTORY, undefined);
+    await f.saveExtra("TEFR_V2_DIRECTORY_LEASE", null);
+    assert.ok(f.runtime.storageError);
+    assert.equal(f.directory.data.scan.paused, true);
+    const broken = fixture();
+    broken.context.PDA_storage = { async loadAll() { throw new Error("offline"); } };
+    await broken.loadPersistentState();
+    assert.ok(broken.runtime.storageError);
+    assert.equal(await broken.directoryRequest(90, 0), false);
+    assert.equal(broken.calls.length, 0);
+});
+
+test("concurrent roster ticks coalesce and page navigation refreshes only the visible page", async () => {
+    const f = fixture(url => page([row(Number(url.searchParams.get("offset")) + 1)]));
+    f.ff.key = "";
+    const d = f.directory.data;
+    d.scan.done = true;
+    await Promise.all([f.directoryRequest(90, 0), f.directoryRequest(90, 0)]);
+    assert.equal(f.calls.length, 1);
+    f.directory.offset = 100;
+    await f.competitionTick();
+    assert.equal(f.calls.length, 2);
+    assert.equal(f.calls[1].params.offset, "100");
+    f.directory.offset = 0;
+    await f.competitionTick();
+    assert.equal(f.calls.length, 3);
+    assert.equal(f.calls[2].params.offset, "0");
+    await f.competitionTick();
+    assert.equal(f.calls.length, 3);
+    assert.equal(f.directory.data.scan.done, true);
+    assert.equal(f.calls.every(c => c.path === "/v2/torn/90/eliminationteam"), true);
 });
 
 test("BS chart labels axes, scales close values and distinguishes sparse samples", () => {

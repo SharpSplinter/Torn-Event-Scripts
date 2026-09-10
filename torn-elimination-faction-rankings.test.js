@@ -302,7 +302,7 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.match(source, /PDA_storage/);
     assert.match(source, /GM_xmlhttpRequest/);
     assert.match(source, /Authorization:\s*"ApiKey "\s*\+\s*key/);
-    const tornRequest = source.slice(source.indexOf("async function requestJson("), source.indexOf("async function requestWithRetry("));
+    const tornRequest = source.slice(source.indexOf("async function requestJson("), source.indexOf("function requestWithRetry("));
     assert.equal(/searchParams\.set\(["']key["']/.test(tornRequest), false);
     assert.equal((source.match(/searchParams\.set\(["']key["']/g) || []).length, 1, "Only the authorized FFScouter query-key exception");
     assert.match(source, /url.searchParams.set\("key", ff.key\)/);
@@ -485,6 +485,40 @@ test("an inactive-event check is persisted to avoid repeated reload requests", a
     assert.equal(reload.calls.length, 0);
 });
 
+test("leaving during a faction scan checkpoints and resumes without repeating completed requests", async () => {
+    let first;
+    const response = endpoint => {
+        if (endpoint === "/user/basic") return { profile: { id: 1, name: "Player 1" } };
+        if (endpoint === "/user/competition" || /^\/user\/\d+\/competition$/.test(endpoint))
+            return { competition: { name: "Elimination", team_id: 90, team: "Loose Cannons", score: 1, attacks: 1 } };
+        if (endpoint === "/faction/members") return { members: [1, 2, 3, 4].map(id => rosterMember(id, "Player " + id)) };
+        if (endpoint === "/faction/44817/members") return { members: [] };
+        if (endpoint.endsWith("/basic")) return { basic: { id: 10, name: "Faction" } };
+        if (endpoint === "/torn/elimination") return { elimination: [{ id: 90, name: "Loose Cannons" }] };
+        assert.fail("Unexpected endpoint " + endpoint);
+    };
+    first = fixtureRuntime(endpoint => {
+        if (endpoint === "/user/2/competition") first.runtime.pageActive = false;
+        return response(endpoint);
+    });
+    assert.equal(await first.refreshData("manual"), false);
+    assert.ok(first.saved.TEFR_V2_PENDING_SCAN.responses["/user/2/competition"]);
+    assert.equal(first.calls.some(call => call.endpoint === "/user/3/competition"), false);
+    const before = first.calls.length;
+    assert.equal(await first.refreshData("scheduled"), false);
+    assert.equal(first.calls.length, before, "Hidden pages issue no new requests");
+    first.saved.TEFR_V1_API_KEY = "fixture-key";
+    const next = fixtureRuntime(response, first.saved);
+    await next.loadPersistentState();
+    assert.equal(await next.catchUpRefresh("resume"), true);
+    assert.deepEqual(next.calls.map(call => call.endpoint), ["/user/3/competition", "/user/4/competition"]);
+    assert.equal(next.saved.TEFR_V2_PENDING_SCAN, null);
+    assert.equal(next.runtime.snapshot.members.length, 4);
+    const reload = fixtureRuntime(() => assert.fail("Completed update should stay cached"), next.saved);
+    await reload.loadPersistentState();
+    assert.equal(await reload.catchUpRefresh("catch-up"), false);
+});
+
 test("refresh integrates alliance rosters, pacing, late enrollment, and retained final records", async () => {
     let closed = false, rosterFailure = false;
     const ownRoster = Array.from({ length: 11 }, (_, index) => rosterMember(index + 1, "Main " + (index + 1)));
@@ -583,6 +617,7 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     assert.equal(runtime.config.faction, "10");
     buttons.alliance();
     assert.equal(runtime.config.faction, "all");
+    await new Promise(resolve => setImmediate(resolve));
     assert.equal(fixture.saved.TEFR_V1_CONFIG.showNonParticipants, true);
     runtime.config.tab = "overview";
     // Legacy cached team aggregates covered every selected faction.
