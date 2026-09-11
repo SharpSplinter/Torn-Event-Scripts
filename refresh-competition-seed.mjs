@@ -28,7 +28,7 @@ for (const item of summary.teams) {
     await new Promise(resolve => setTimeout(resolve, 1200));
 }
 const seed = { year: new Date().getUTCFullYear(), fetchedAt: Date.now(), teams };
-const target = path.join(root, "Torn Elimination Faction Rankings.user.js");
+const target = path.join(root, "Torn Elimination Faction Rankings Beta.user.js");
 const source = await fs.readFile(target, "utf8");
 const pattern = /    \/\/ BEGIN GENERATED COMPETITION SEED[\s\S]*?    \/\/ END GENERATED COMPETITION SEED/;
 if (!pattern.test(source)) throw new Error("Seed markers missing");

@@ -6,7 +6,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const vm = require("node:vm");
 
-const scriptPath = path.join(__dirname, "Torn Elimination Faction Rankings.user.js");
+const scriptPath = path.join(__dirname, "Torn Elimination Faction Rankings Beta.user.js");
 const api = require(scriptPath);
 
 test("personal Team place uses the global event position out of 12, not tracked-player count", () => {
@@ -291,6 +291,14 @@ test("alliance and faction ranks are separate; duplicates and stale rosters do n
 
 test("userscript security and TornPDA compatibility invariants", () => {
     const source = fs.readFileSync(scriptPath, "utf8").replace(/\/\/ BEGIN GENERATED COMPETITION SEED[\s\S]*?\/\/ END GENERATED COMPETITION SEED/, "");
+    assert.match(source, /@name\s+Torn Elimination Faction Rankings Beta/);
+    assert.match(source, /@namespace\s+https:\/\/github\.com\/SharpSplinter\/Torn-Event-Scripts\/beta/);
+    assert.match(source, /@version\s+1\.5\.2-beta\.1/);
+    assert.match(source, /Torn-Event-Scripts\/test\/Torn%20Elimination%20Faction%20Rankings%20Beta\.user\.js/);
+    assert.match(source, /const ROOT_ID = "tefr-beta-root"/);
+    assert.match(source, /__TEFR_BETA_BOOTSTRAPPED__/);
+    assert.match(source, /replaceAll\("#tefr-root", "#" \+ ROOT_ID\)/);
+    assert.match(source, /host\.querySelector\(":scope > #tefr-root"\)/);
     // TornPDA does a literal text substitution of exactly "###PDA-APIKEY###"
     // wherever it appears in the source. Any extra characters immediately
     // touching the placeholder (e.g. wrapping underscores) would survive the
@@ -325,7 +333,7 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.ok(source.includes('#tefr-root.is-collapsed>.tefr-body{display:none}'));
     assert.ok(source.includes('tabindex="0" aria-label="Scrollable dashboard content"'));
     assert.doesNotMatch(source, /const host = doc\.querySelector\("#mainContainer"\)/);
-    assert.match(source, /\[TEFR\]/);
+    assert.match(source, /\[TEFR Beta\]/);
     assert.match(source, /tefr-spinner/);
     assert.match(source, /aria-valuenow/);
     assert.match(source, /Detected runtime/);

@@ -4,7 +4,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const file = path.join(__dirname, "Torn Elimination Faction Rankings.user.js");
+const file = path.join(__dirname, "Torn Elimination Faction Rankings Beta.user.js");
 const api = require(file);
 const now = Date.parse("2026-09-09T20:00:00Z");
 const team = { id: 90, name: "Loose Cannons", participants: 101 };
@@ -412,7 +412,7 @@ test("native storage failures never fall back or disappear after a lease write",
     assert.ok(f.runtime.storageError);
     assert.equal(f.directory.data.scan.paused, true);
     const logs = JSON.stringify(f.logs);
-    assert.match(logs, /\[TEFR\]\[Storage\] Storage write failed/);
+    assert.match(logs, /\[TEFR Beta\]\[Storage\] Storage write failed/);
     assert.match(logs, /PDA_storage\.setMany/);
     assert.match(logs, /TEFR_V2_DIRECTORY/);
     assert.match(logs, /payloadCharacters/);

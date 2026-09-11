@@ -48,7 +48,7 @@ window.GM_xmlhttpRequest=details=>{
 </script>`;
 const server = http.createServer((req,res)=>{
  if(req.url==="/userscript.js"){
-  const source=fs.readFileSync(path.join(root,"Torn Elimination Faction Rankings.user.js"),"utf8")
+  const source=fs.readFileSync(path.join(root,"Torn Elimination Faction Rankings Beta.user.js"),"utf8")
    .replace('if (typeof window !== "undefined" && window.document) void api.bootstrap(window);','window.fixture = api.hooks;')
    .replace("        VERSION, REQUEST_GAP_MS,","        hooks: { runtime, directory, ff, mount, loadPersistentState, loadCompetition, refreshLiveTeams, refreshVisibleEstimates, updateHospitalTimers, render },\n        VERSION, REQUEST_GAP_MS,");
   res.writeHead(200,{"Content-Type":"application/javascript; charset=utf-8"});res.end(source);

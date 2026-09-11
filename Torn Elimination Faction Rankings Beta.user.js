@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Torn Elimination Faction Rankings
-// @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.2
-// @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
+// @name         Torn Elimination Faction Rankings Beta
+// @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts/beta
+// @version      1.5.2-beta.1
+// @description  Beta build of compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
 // @match        https://www.torn.com/factions.php*
@@ -17,9 +17,9 @@
 // @grant        GM_info
 // @connect      api.torn.com
 // @connect      ffscouter.com
-// @updateURL   https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
-// @downloadURL https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
-// @source      https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/main/Torn%20Elimination%20Faction%20Rankings.user.js
+// @updateURL   https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/test/Torn%20Elimination%20Faction%20Rankings%20Beta.user.js
+// @downloadURL https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/test/Torn%20Elimination%20Faction%20Rankings%20Beta.user.js
+// @source      https://raw.githubusercontent.com/SharpSplinter/Torn-Event-Scripts/test/Torn%20Elimination%20Faction%20Rankings%20Beta.user.js
 // ==/UserScript==
 
 (function(factory) {
@@ -30,11 +30,11 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.2";
+    const VERSION = "1.5.2-beta.1";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
-    const ROOT_ID = "tefr-root";
+    const ROOT_ID = "tefr-beta-root";
     const NOT_PARTICIPATING = "Not Participating";
     const ENROLLMENT_END_MS = Date.UTC(2026, 8, 10, 12);
     const REQUEST_GAP_MS = 1200;
@@ -113,12 +113,12 @@
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     function debugLog(event, details = {}) {
         if (typeof console !== "undefined" && typeof console.debug === "function") {
-            console.debug("[TEFR] " + event, details);
+            console.debug("[TEFR Beta] " + event, details);
         }
     }
     function infoLog(event, details = {}) {
         if (typeof console !== "undefined" && typeof console.info === "function") {
-            console.info("[TEFR] " + event, details);
+            console.info("[TEFR Beta] " + event, details);
         }
     }
 
@@ -141,7 +141,7 @@
         const method = typeof console[level] === "function" ? level
             : typeof console.warn === "function" ? "warn" : "log";
         if (typeof console[method] === "function") {
-            console[method]("[TEFR][Storage] " + event, details);
+            console[method]("[TEFR Beta][Storage] " + event, details);
         }
     }
 
@@ -1320,7 +1320,7 @@
             runtime.error = safeApiMessage(error);
             runtime.status = "Refresh failed.";
             runtime.retryNotBefore = Date.now() + 5 * 60 * 1000;
-            console.warn("[TEFR] Refresh failed", {
+            console.warn("[TEFR Beta] Refresh failed", {
                 reason, code: error?.code ?? null, status: error?.status || 0,
                 message: runtime.error
             });
@@ -1947,7 +1947,7 @@
             + 'new members and failed checks stay in the update queue. Refresh manually to recheck everyone.</p>'
             + '<button type="button" class="danger" data-action="clear-history">Clear rank history</button></section>'
             + '<section class="tefr-panel"><h3>Diagnostics</h3><p>Open the F12 console and filter for '
-            + '<code>[TEFR]</code> for general events or <code>[TEFR][Storage]</code> for detailed, '
+            + '<code>[TEFR Beta]</code> for general events or <code>[TEFR Beta][Storage]</code> for detailed, '
             + 'credential-safe bridge, load, read, write, recovery, and failure diagnostics.</p>'
             + '<code>/user/basic</code> <code>/faction/basic</code> '
             + '<code>/faction/{id}/basic</code> <code>/faction/{id}/members</code> '
@@ -2000,13 +2000,13 @@
             ["overview", "Overview"], ["ranking", rankingLabel() + " Ranking"],
             ["teams", "Teams"], ["trends", "Trends"], ["competition", "Competition Players"], ["settings", "Settings"]
         ];
-        runtime.root.className = "tefr-root" + (detectedRuntime().startsWith("TornPDA") ? " is-pda" : "")
+        runtime.root.className = ROOT_ID + (detectedRuntime().startsWith("TornPDA") ? " is-pda" : "")
             + (runtime.config.collapsed ? " is-collapsed" : "")
             + (runtime.busy ? " is-busy" : "");
         const percent = runtime.progress?.total
             ? Math.round(runtime.progress.done / runtime.progress.total * 100) : 0;
         runtime.root.innerHTML = '<header class="tefr-header"><div class="tefr-title">'
-            + '<span class="tefr-logo">E</span><div><h2>Elimination Faction Rankings</h2>'
+            + '<span class="tefr-logo">B</span><div><h2>Elimination Faction Rankings Beta</h2>'
             + '<span class="tefr-status-line">' + (runtime.busy
                 ? '<i class="tefr-spinner" aria-hidden="true"></i>' : "")
             + '<span data-role="progress-text" aria-live="polite">'
@@ -3359,10 +3359,12 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
     }
 
     function injectStyle(doc) {
-        if (doc.getElementById("tefr-style")) return;
+        if (doc.getElementById(ROOT_ID + "-style")) return;
         const style = doc.createElement("style");
-        style.id = "tefr-style";
-        style.textContent = STYLE;
+        style.id = ROOT_ID + "-style";
+        style.textContent = STYLE
+            .replaceAll("#tefr-root", "#" + ROOT_ID)
+            .replaceAll(".tefr-root", "." + ROOT_ID);
         doc.head.appendChild(style);
     }
 
@@ -3373,7 +3375,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             || main.querySelector(".content-wrapper");
         if (!content) return null;
         const host = content.querySelector("#factions") || content;
-        const before = host.querySelector(":scope > .ui-tabs-panel")
+        const before = host.querySelector(":scope > #tefr-root")
+            || host.querySelector(":scope > .ui-tabs-panel")
             || host.querySelector(":scope > #faction-main")
             || null;
         return { host, before };
@@ -3388,7 +3391,7 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         if (!root) {
             root = doc.createElement("section");
             root.id = ROOT_ID;
-            root.setAttribute("aria-label", "Elimination faction rankings");
+            root.setAttribute("aria-label", "Elimination faction rankings beta");
         }
         const positioned = root.parentElement === host
             && (!before || root.nextElementSibling === before);
@@ -3438,8 +3441,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
     }
 
     async function bootstrap(win) {
-        if (win.top !== win || win.__TEFR_BOOTSTRAPPED__) return;
-        win.__TEFR_BOOTSTRAPPED__ = true;
+        if (win.top !== win || win.__TEFR_BETA_BOOTSTRAPPED__) return;
+        win.__TEFR_BETA_BOOTSTRAPPED__ = true;
         watchPdaBridge(win);
         await loadPersistentState();
         await loadCompetition();
