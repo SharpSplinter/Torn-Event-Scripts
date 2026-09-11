@@ -156,7 +156,7 @@ test("faction ranking follows all tie-breaks and assigns team ranks", () => {
         rankedMember(2, "Charlie", 20, 1, 2),
         rankedMember(1, "alpha", 10, 2, 1)
     ]);
-    assert.deepEqual(ranked.map((member) => member.id), [2, 1, 4, 3, 5]);
+    assert.deepEqual(ranked.map((member) => member.id), [1, 4, 3, 2, 5]);
     assert.deepEqual(ranked.map((member) => member.factionRank), [1, 2, 3, 4, 5]);
     assert.equal(ranked.find((member) => member.id === 1).teamRank, 1);
     assert.equal(ranked.find((member) => member.id === 4).teamRank, 2);
@@ -199,7 +199,7 @@ test("team aggregation keeps global and faction-only totals separate", () => {
     assert.equal(teams[0].score, 50000);
     assert.equal(teams[0].lives, 900);
     assert.equal(teams[0].factionMembers, 2);
-    assert.equal(teams[0].factionScore, 25);
+    assert.equal(teams[0].factionScore, 0, "Never sum team tickets across members");
     assert.equal(teams[0].factionAttacks, 5);
 });
 
@@ -276,7 +276,7 @@ test("alliance and faction ranks are separate; duplicates and stale rosters do n
     assert.equal(merged.length, 3);
     assert.equal(merged.find((member) => member.id === 3).name, "Moved");
     const ranked = api.rankMembers(merged.map((member) => api.normalizeMember(member, {
-        competition: { name: "Elimination", team_id: 7, team: "Team", score: member.id * 10, attacks: 2 }
+        competition: { name: "Elimination", team_id: 7, team: "Team", score: 500, attacks: member.id * 2 }
     })));
     assert.deepEqual(ranked.map((member) => member.allianceRank), [1, 2, 3]);
     assert.equal(ranked.find((member) => member.id === 1).factionRank, 1);
@@ -296,13 +296,15 @@ test("userscript security and TornPDA compatibility invariants", () => {
     // touching the placeholder (e.g. wrapping underscores) would survive the
     // substitution and get baked into the injected key, making it invalid.
     assert.equal((source.match(/PDA_KEY_RAW = "###PDA-APIKEY###";/g) || []).length, 1);
-    assert.doesNotMatch(source, /tickets?/i);
+    assert.match(source, /Team tickets/);
+    for (const page of ["factions.php*", "page.php?sid=elimination*", "hospitalview.php*", "page.php?sid=attack&user2ID*"])
+        assert.ok(source.includes("// @match        https://www.torn.com/" + page));
     assert.match(source, /Public-access key only/);
     assert.match(source, /PDA_httpGet/);
     assert.match(source, /PDA_storage/);
     assert.match(source, /GM_xmlhttpRequest/);
     assert.match(source, /Authorization:\s*"ApiKey "\s*\+\s*key/);
-    const tornRequest = source.slice(source.indexOf("async function requestJson("), source.indexOf("function requestWithRetry("));
+    const tornRequest = source.slice(source.indexOf("function requestJson("), source.indexOf("function requestWithRetry("));
     assert.equal(/searchParams\.set\(["']key["']/.test(tornRequest), false);
     assert.equal((source.match(/searchParams\.set\(["']key["']/g) || []).length, 1, "Only the authorized FFScouter query-key exception");
     assert.match(source, /url.searchParams.set\("key", ff.key\)/);
@@ -625,8 +627,8 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     runtime.snapshot.teams[0].factionScore = 999999;
     fixture.render();
     for (const [label, value] of [
-        ["Faction Score", 66], ["Faction Attacks", 11], ["Faction Members", 11],
-        ["Alliance Score", 78], ["Alliance Attacks", 12], ["Alliance Members", 12]
+        ["Faction Attacks", 11], ["Faction Members", 11],
+        ["Alliance Attacks", 12], ["Alliance Members", 12]
     ]) {
         assert.ok(runtime.root.innerHTML.includes("<small>" + label + "</small><b>" + value + "</b>"), label);
     }

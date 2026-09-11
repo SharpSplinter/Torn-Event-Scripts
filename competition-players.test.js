@@ -33,7 +33,7 @@ function fixture(responder = () => [], saved = {}) {
         }
     };
     const source = fs.readFileSync(file, "utf8").replace("        VERSION, REQUEST_GAP_MS,",
-        "        hooks: { directory, ff, runtime, loadPersistentState, readShared, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
+        "        hooks: { requestJson, liveTeams, refreshLiveTeams, currentTeams, migrateAttackRankings, tabRefreshControl, refreshTab, directory, ff, runtime, loadPersistentState, readShared, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
     vm.runInNewContext(source, context);
     const h = context.module.exports.hooks;
     h.runtime.config.tab = "competition";
@@ -271,14 +271,16 @@ test("directory closure cooldown persists and does not trigger per-player Torn r
     assert.equal(f.calls.length, 1);
 });
 
-test("hidden tab and faction scan pause directory network operations", async () => {
+test("hidden tabs pause requests; faction scans pause indexing but not on-demand pages", async () => {
     const f = fixture(() => page([row(1)]));
     f.context.document.visibilityState = "hidden";
     assert.equal(await f.directoryRequest(90, 0), false);
     f.context.document.visibilityState = "visible";
     f.runtime.busy = true;
-    assert.equal(await f.directoryRequest(90, 0), false);
+    assert.equal(await f.directoryRequest(90, 0, true), false);
     assert.equal(f.calls.length, 0);
+    assert.equal(await f.directoryRequest(90, 0), true);
+    assert.equal(f.calls.length, 1);
 });
 
 test("storage failure keeps in-memory data, pauses scan and preserves faction history", async () => {
@@ -342,6 +344,23 @@ test("native storage failures never fall back or disappear after a lease write",
     assert.equal(broken.calls.length, 0);
 });
 
+test("failed shared reads never overwrite an index with an older in-memory copy", async () => {
+    const f = fixture(() => page([row(1)]));
+    const saved = { TEFR_V2_DIRECTORY: { marker: "retain" } };
+    f.context.PDA_storage = {
+        async loadAll() { return structuredClone(saved); },
+        async get() { throw new Error("bridge unavailable"); },
+        async setMany(values) { Object.assign(saved, structuredClone(values)); }
+    };
+    await f.loadPersistentState();
+    f.runtime.config.tab = "competition";
+    f.runtime.apiKey = "main-test-key";
+    assert.equal(await f.directoryRequest(90, 0), false);
+    assert.equal(f.calls.length, 0);
+    assert.equal(saved.TEFR_V2_DIRECTORY.marker, "retain");
+    assert.ok(f.runtime.storageError);
+});
+
 test("concurrent roster ticks coalesce and page navigation refreshes only the visible page", async () => {
     const f = fixture(url => page([row(Number(url.searchParams.get("offset")) + 1)]));
     f.ff.key = "";
@@ -361,6 +380,135 @@ test("concurrent roster ticks coalesce and page navigation refreshes only the vi
     assert.equal(f.calls.length, 3);
     assert.equal(f.directory.data.scan.done, true);
     assert.equal(f.calls.every(c => c.path === "/v2/torn/90/eliminationteam"), true);
+});
+
+test("TornPDA without its native bridge fails closed instead of saving to page storage", async () => {
+    const f = fixture();
+    f.context.PDA_httpGet = async () => { throw new Error("Must not request"); };
+    await f.loadPersistentState();
+    assert.match(f.runtime.storageError, /PDA_storage/);
+    assert.equal(await f.saveExtra("TEFR_V2_DIRECTORY", f.directory.data), false);
+    assert.equal(f.saved.TEFR_V2_DIRECTORY, undefined);
+    assert.equal(await f.directoryRequest(90, 0), false);
+});
+
+test("on-demand pages bypass index chunk pauses without clearing the index pause", async () => {
+    const f = fixture(() => page([row(1)]));
+    f.ff.key = "";
+    f.directory.data.scan.requests = 9;
+    f.directory.data.scan.retryAt = now + 10000;
+    await f.competitionTick();
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.directory.data.scan.requests, 9);
+    assert.equal(f.directory.data.scan.retryAt, now + 10000);
+    f.advance(5000);
+    await f.competitionTick();
+    assert.equal(f.calls.length, 2, "Only the current page repeats after five seconds");
+});
+
+test("near-live teams are paced, persisted separately, and stop on hidden pages", async () => {
+    const teams = Array.from({ length: 12 }, (_, i) => ({
+        id: 70 + i, name: "Team " + i, score: 100 + i, lives: 10,
+        wins: i, losses: 0, position: i + 1, participants: 100, eliminated: false
+    }));
+    const f = fixture(() => ({ elimination: teams }));
+    f.runtime.config.tab = "overview";
+    assert.equal(await f.refreshLiveTeams(), true);
+    assert.equal(f.currentTeams().length, 12);
+    assert.equal(f.saved.TEFR_V2_LIVE_TEAMS.teams.length, 12);
+    assert.equal(f.saved.TEFR_V1_SNAPSHOT, undefined, "Does not reset the faction freshness clock");
+    assert.equal(await f.refreshLiveTeams(), false);
+    f.advance(3000);
+    assert.equal(await f.refreshLiveTeams(), true);
+    assert.equal(await f.refreshLiveTeams(true), true, "Manual standings refresh bypasses freshness");
+    assert.ok(f.calls.every(c => c.path === "/v2/torn/elimination"));
+    assert.ok(f.calls.slice(1).every((c, i) => c.at - f.calls[i].at >= api.REQUEST_GAP_MS));
+    f.context.document.visibilityState = "hidden";
+    assert.equal(await f.refreshLiveTeams(true), false);
+    assert.equal(f.calls.length, 3);
+});
+
+test("live teams preserve cached standings and honor API rate-limit cooldowns", async () => {
+    const f = fixture(() => ({ error: { code: 5, error: "NEVER_ECHO_KEY" } }));
+    f.runtime.config.tab = "overview";
+    f.liveTeams.data = { year: 2026, updatedAt: now - 10000, teams: [team] };
+    assert.equal(await f.refreshLiveTeams(), false);
+    assert.equal(f.liveTeams.data.teams[0].id, 90);
+    assert.equal(await f.refreshLiveTeams(true), false);
+    assert.equal(f.calls.length, 1);
+    assert.ok(f.liveTeams.retryAt >= now + 60000);
+    assert.equal(JSON.stringify(f.logs).includes("NEVER_ECHO_KEY"), false);
+});
+
+test("obsolete queued Torn requests are discarded before spending API quota", async () => {
+    let finish;
+    const f = fixture(() => new Promise(resolve => { finish = resolve; }));
+    const first = f.requestJson("/torn/elimination", "test-key");
+    await new Promise(resolve => setImmediate(resolve));
+    let relevant = true;
+    const second = f.requestJson("/torn/90/eliminationteam", "test-key", {}, () => relevant);
+    const rejected = assert.rejects(second, error => error.paused === true);
+    relevant = false;
+    finish({});
+    await first;
+    await rejected;
+    assert.equal(f.calls.length, 1);
+});
+
+test("invalid Torn keys stop automatic polling until explicitly replaced", async () => {
+    const f = fixture(() => ({ error: { code: 2 } }));
+    f.runtime.config.tab = "overview";
+    assert.equal(await f.refreshLiveTeams(), false);
+    f.advance(120000);
+    assert.equal(await f.refreshLiveTeams(), false);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.runtime.tornBlocked, 2);
+});
+
+test("cached ranks and history migrate to attacks without multiplying tickets", async () => {
+    const f = fixture();
+    f.runtime.snapshot = { members: [
+        { id: 1, name: "A", score: 5000, attacks: 1, factionId: 10, teamId: 70, teamName: "A", participating: true },
+        { id: 2, name: "B", score: 1, attacks: 20, factionId: 10, teamId: 71, teamName: "B", participating: true }
+    ], teams: [] };
+    f.runtime.history = { points: [{ members: {
+        1: [1, 1, 5000, 1, 70, "A", 10, 1], 2: [2, 1, 1, 20, 71, "B", 10, 2]
+    }, teams: { 70: [5000, 10, 5000, 1, 1] } }] };
+    await f.migrateAttackRankings();
+    assert.deepEqual(Array.from(f.runtime.snapshot.members, m => m.id), [2, 1]);
+    assert.equal(f.runtime.history.points[0].members[1][0], 2);
+    assert.equal(f.runtime.history.points[0].members[2][7], 1);
+    assert.equal(f.runtime.history.points[0].teams[70][2], null);
+    assert.equal(f.saved.TEFR_V1_SNAPSHOT.rankingMetric, "attacks");
+});
+
+test("life-loss checkpoints and all tie-breaks follow the official rules", () => {
+    const start = api.ELIMINATION_START_MS;
+    const t = (id, score, wins, losses, lives) => ({ id, score, wins, losses, lives, name: "T" + id, eliminated: false });
+    const teams = [t(1, 99, 5, 1, 2), t(2, 100, 0, 99, 1), t(3, 99, 4, 1, 2),
+        t(4, 99, 4, 2, 3), t(5, 99, 4, 2, 1), t(6, 1, 0, 9, 0)];
+    const before = api.lifeLossState(teams, start - 1);
+    assert.equal(before.started, false);
+    assert.equal(before.next, start);
+    assert.deepEqual(before.atRisk.map(t => t.id), [5]);
+    assert.equal(api.lifeLossState(teams, start).next, start + 900000);
+    assert.equal(api.lifeLossState(teams, start + 900000).next, start + 1800000);
+    teams.push(t(7, 99, 4, 2, 1));
+    assert.deepEqual(api.lifeLossState(teams, start).atRisk.map(t => t.id), [5, 7]);
+    const final = Array.from({ length: 12 }, (_, i) => ({ ...t(i, 100, 1, 1, i === 5 ? 1 : 0), eliminated: i !== 5 }));
+    assert.equal(api.lifeLossState(final, start).winner.id, 5);
+    assert.equal(api.lifeLossState(final, start).tickets, 100);
+});
+
+test("overview, ranking and teams have distinct scoped refresh controls", () => {
+    const f = fixture();
+    for (const tab of ["overview", "ranking", "teams"]) {
+        f.runtime.config.tab = tab;
+        assert.match(f.tabRefreshControl(), /data-refresh-tab/);
+        assert.match(f.tabRefreshControl(), /total attacks only/);
+    }
+    f.runtime.config.tab = "competition";
+    assert.equal(f.tabRefreshControl(), "");
 });
 
 test("BS chart labels axes, scales close values and distinguishes sparse samples", () => {

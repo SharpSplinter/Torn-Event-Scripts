@@ -17,6 +17,9 @@ if(new URLSearchParams(location.search).has("pda")) {
 window.GM_xmlhttpRequest=details=>{
  const u=new URL(details.url);
  let data={error:{code:32}};
+ if(u.hostname==="api.torn.com"&&u.pathname.endsWith("/elimination")){
+  data={elimination:window.fixture.directory.data.teams.map((t,i)=>({...t,score:1000+i*10+Math.floor(Date.now()/3000)%10,lives:100,position:i+1,wins:100+i,losses:10,eliminated:false}))};
+ }
  if(u.hostname==="ffscouter.com"){
   if(u.pathname.endsWith("check-key"))data={is_registered:true,is_premium:false};
   else if(u.pathname.endsWith("get-stats"))data=u.searchParams.get("targets").split(",").map(id=>({player_id:Number(id),fair_fight:2.17,bs_estimate:744101542,source:"bss",last_updated:Math.floor(Date.now()/1000)-86400}));
@@ -31,6 +34,7 @@ window.GM_xmlhttpRequest=details=>{
  await h.loadPersistentState();
  await h.loadCompetition();
  h.runtime.config.tab="competition";
+ h.runtime.apiKey="fixture-public-key";
  h.runtime.status="Local preview — fixture data, no live API requests";
  h.directory.team=String(h.directory.data.teams[0].id);
  h.ff.key="fixturekey123456";h.ff.validated=true;
@@ -38,6 +42,7 @@ window.GM_xmlhttpRequest=details=>{
  h.directory.data.players[first.id]={...first,source:"torn",updatedAt:Date.now(),status:{state:"Hospital",until:Date.now()/1000+120},lastAction:{status:"Online"}};
  h.mount(document);
  setInterval(()=>h.updateHospitalTimers(),1000);
+ setInterval(()=>h.refreshLiveTeams(),1000);
  await h.refreshVisibleEstimates();
 })();
 </script>`;
@@ -45,7 +50,7 @@ const server = http.createServer((req,res)=>{
  if(req.url==="/userscript.js"){
   const source=fs.readFileSync(path.join(root,"Torn Elimination Faction Rankings.user.js"),"utf8")
    .replace('if (typeof window !== "undefined" && window.document) void api.bootstrap(window);','window.fixture = api.hooks;')
-   .replace("        VERSION, REQUEST_GAP_MS,","        hooks: { runtime, directory, ff, mount, loadPersistentState, loadCompetition, refreshVisibleEstimates, updateHospitalTimers, render },\n        VERSION, REQUEST_GAP_MS,");
+   .replace("        VERSION, REQUEST_GAP_MS,","        hooks: { runtime, directory, ff, mount, loadPersistentState, loadCompetition, refreshLiveTeams, refreshVisibleEstimates, updateHospitalTimers, render },\n        VERSION, REQUEST_GAP_MS,");
   res.writeHead(200,{"Content-Type":"application/javascript; charset=utf-8"});res.end(source);
  }else{res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});res.end(html);}
 });
