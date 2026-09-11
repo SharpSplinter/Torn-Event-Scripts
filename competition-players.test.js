@@ -81,7 +81,10 @@ test("late native readiness restores saved index and checkpoint without fallback
     assert.equal(f.directory.data.players[1].status.state, "Okay");
     assert.equal(writes, 0);
     assert.deepEqual(f.saved, {});
-    assert.equal(JSON.stringify(f.logs).includes("private bridge error"), false);
+    const recoveryLogs = JSON.stringify(f.logs);
+    assert.match(recoveryLogs, /PDA_storage\.loadAll failed/);
+    assert.match(recoveryLogs, /private bridge error/);
+    assert.match(recoveryLogs, /Late bridge recovery succeeded/);
 });
 
 test("readiness event before timeout permits the first native load", async () => {
@@ -394,18 +397,27 @@ test("TornPDA native storage shares the completed index and pending scan across 
 
 test("native storage failures never fall back or disappear after a lease write", async () => {
     const f = fixture();
+    const secret = "sensitive-storage-test-key";
     f.context.PDA_storage = {
         async loadAll() { return {}; },
         async setMany(values) {
-            if ("TEFR_V2_DIRECTORY" in values) throw new Error("quota");
+            if ("TEFR_V2_DIRECTORY" in values) throw new Error("quota exceeded for " + secret);
         }
     };
     await f.loadPersistentState();
+    f.runtime.apiKey = secret;
     assert.equal(await f.saveExtra("TEFR_V2_DIRECTORY", f.directory.data), false);
     assert.equal(f.saved.TEFR_V2_DIRECTORY, undefined);
     await f.saveExtra("TEFR_V2_DIRECTORY_LEASE", null);
     assert.ok(f.runtime.storageError);
     assert.equal(f.directory.data.scan.paused, true);
+    const logs = JSON.stringify(f.logs);
+    assert.match(logs, /\[TEFR\]\[Storage\] Storage write failed/);
+    assert.match(logs, /PDA_storage\.setMany/);
+    assert.match(logs, /TEFR_V2_DIRECTORY/);
+    assert.match(logs, /payloadCharacters/);
+    assert.match(logs, /quota exceeded for \[redacted\]/);
+    assert.equal(logs.includes(secret), false);
     const broken = fixture();
     broken.context.PDA_storage = { async loadAll() { throw new Error("offline"); } };
     await broken.loadPersistentState();
@@ -429,6 +441,11 @@ test("failed shared reads never overwrite an index with an older in-memory copy"
     assert.equal(f.calls.length, 0);
     assert.equal(saved.TEFR_V2_DIRECTORY.marker, "retain");
     assert.ok(f.runtime.storageError);
+    const logs = JSON.stringify(f.logs);
+    assert.match(logs, /Shared storage read failed/);
+    assert.match(logs, /PDA_storage\.get/);
+    assert.match(logs, /bridge unavailable/);
+    assert.match(logs, /TEFR_V2_DIRECTORY_LEASE/);
 });
 
 test("concurrent roster ticks coalesce and page navigation refreshes only the visible page", async () => {
@@ -457,6 +474,7 @@ test("TornPDA without its native bridge fails closed instead of saving to page s
     f.context.PDA_httpGet = async () => { throw new Error("Must not request"); };
     await f.loadPersistentState();
     assert.match(f.runtime.storageError, /PDA_storage/);
+    assert.match(JSON.stringify(f.logs), /Native storage API was not found/);
     assert.equal(await f.saveExtra("TEFR_V2_DIRECTORY", f.directory.data), false);
     assert.equal(f.saved.TEFR_V2_DIRECTORY, undefined);
     assert.equal(await f.directoryRequest(90, 0), false);

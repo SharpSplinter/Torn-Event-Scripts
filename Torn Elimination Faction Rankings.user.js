@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.1
+// @version      1.5.2
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.1";
+    const VERSION = "1.5.2";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -119,6 +119,29 @@
     function infoLog(event, details = {}) {
         if (typeof console !== "undefined" && typeof console.info === "function") {
             console.info("[TEFR] " + event, details);
+        }
+    }
+
+    function safeStorageFailure(error) {
+        let message = String(error?.message || error || "No error message was provided.");
+        for (const secret of [runtime.apiKey, runtime.injectedKey, ff.key]) {
+            if (secret && secret.length >= 8) message = message.split(secret).join("[redacted]");
+        }
+        message = message
+            .replace(/(authorization\s*[:=]\s*)([^\s,;]+)/gi, "$1[redacted]")
+            .replace(/([?&](?:key|apiKey|api_key)=)[^&#\s]+/gi, "$1[redacted]")
+            .slice(0, 500);
+        const detail = { name: String(error?.name || "Error"), message };
+        if (["string", "number"].includes(typeof error?.code)) detail.code = error.code;
+        return detail;
+    }
+
+    function storageLog(level, event, details = {}) {
+        if (typeof console === "undefined") return;
+        const method = typeof console[level] === "function" ? level
+            : typeof console.warn === "function" ? "warn" : "log";
+        if (typeof console[method] === "function") {
+            console[method]("[TEFR][Storage] " + event, details);
         }
     }
 
@@ -485,41 +508,85 @@
     function watchPdaBridge(win) {
         if (pdaBridge.window === win) return;
         pdaBridge.window = win;
+        storageLog("debug", "Watching for TornPDA bridge readiness", {
+            pdaStorageDefined: typeof PDA_storage !== "undefined",
+            bridgeCallable: typeof win?.flutter_inappwebview?.callHandler === "function"
+        });
         win.addEventListener("flutterInAppWebViewPlatformReady", () => {
             pdaBridge.ready = true;
             pdaBridge.pending = true;
+            storageLog("info", "TornPDA bridge readiness event received", {
+                pdaStorageDefined: typeof PDA_storage !== "undefined",
+                bridgeCallable: typeof win?.flutter_inappwebview?.callHandler === "function",
+                recoveryQueued: true
+            });
         }, { once: true });
     }
 
     async function waitForPdaBridge() {
         const win = pdaBridge.window;
-        if (!win || pdaBridge.ready) return;
+        if (!win) {
+            storageLog("debug", "Bridge wait skipped", { reason: "No browser window is registered." });
+            return;
+        }
+        if (pdaBridge.ready) {
+            storageLog("debug", "Bridge wait skipped", { reason: "Readiness event was already received." });
+            return;
+        }
+        storageLog("info", "Waiting for TornPDA bridge readiness", { timeoutMs: 1800 });
         await new Promise(resolve => {
             let timer;
+            let outcome = "readiness event";
             const done = () => {
                 clearTimeout(timer);
                 win.removeEventListener("flutterInAppWebViewPlatformReady", done);
+                storageLog(outcome === "timeout" ? "warn" : "info",
+                    "TornPDA bridge wait finished", {
+                        outcome,
+                        pdaStorageDefined: typeof PDA_storage !== "undefined",
+                        bridgeCallable: typeof win?.flutter_inappwebview?.callHandler === "function"
+                    });
                 resolve();
             };
             win.addEventListener("flutterInAppWebViewPlatformReady", done, { once: true });
-            timer = setTimeout(done, 1800);
+            timer = setTimeout(() => { outcome = "timeout"; done(); }, 1800);
         });
     }
 
     async function recoverPdaStorage() {
         if (!pdaBridge.pending || pdaBridge.recovering || runtime.resuming
             || runtime.busy || directory.busy || !pageActive()) return;
+        storageLog("info", "Late bridge recovery started", {
+            previousMode: runtime.storageMode,
+            hadCachedNativeValues: Boolean(runtime.nativeValues)
+        });
         pdaBridge.pending = false;
         pdaBridge.recovering = true;
         runtime.resuming = true;
         try {
             await loadPersistentState();
-            if (!runtime.nativeValues || runtime.storageError) return;
+            if (!runtime.nativeValues || runtime.storageError) {
+                storageLog("error", "Late bridge recovery did not restore storage", {
+                    mode: runtime.storageMode,
+                    storageError: runtime.storageError || "Native values were unavailable."
+                });
+                return;
+            }
             directory.loaded = false;
             directory.lastViewedPage = "";
             directory.displayIds = [];
             await loadCompetition();
             render();
+            storageLog("info", "Late bridge recovery succeeded", {
+                mode: runtime.storageMode,
+                directoryRestored: Boolean(directory.data),
+                pendingFactionUpdateRestored: Boolean(runtime.scan)
+            });
+        } catch (error) {
+            storageLog("error", "Late bridge recovery threw an exception", {
+                failure: safeStorageFailure(error)
+            });
+            throw error;
         } finally {
             runtime.resuming = false;
             pdaBridge.recovering = false;
@@ -537,8 +604,15 @@
             }
             const raw = localStorage.getItem(key);
             return raw === null ? fallback : JSON.parse(raw);
-        } catch (_) {
+        } catch (error) {
             runtime.storageError = "Shared script storage could not be read. Updates are paused to protect saved data.";
+            storageLog("error", "Legacy storage read failed", {
+                record: key,
+                backend: typeof GM_getValue === "function" ? "GM_getValue"
+                    : typeof GM !== "undefined" && typeof GM.getValue === "function"
+                        ? "GM.getValue" : "localStorage",
+                failure: safeStorageFailure(error)
+            });
             return fallback;
         }
     }
@@ -568,24 +642,59 @@
     }
 
     async function loadPersistentState() {
+        storageLog("info", "Persistent-state load started", {
+            runtime: detectedRuntime(),
+            pdaStorageDefined: typeof PDA_storage !== "undefined",
+            loadAllAvailable: typeof PDA_storage !== "undefined"
+                && typeof PDA_storage?.loadAll === "function",
+            getAvailable: typeof PDA_storage !== "undefined"
+                && typeof PDA_storage?.get === "function",
+            setManyAvailable: typeof PDA_storage !== "undefined"
+                && typeof PDA_storage?.setMany === "function",
+            bridgeReadyEventSeen: pdaBridge.ready
+        });
         if (nativeStore() || detectedRuntime().startsWith("TornPDA")) await waitForPdaBridge();
         const store = nativeStore();
         if (!store && detectedRuntime().startsWith("TornPDA")) {
             runtime.storageMode = "TornPDA native storage unavailable";
             runtime.storageError = "PDA_storage is unavailable. Update TornPDA or restore its storage bridge; updates are paused to protect the index.";
+            storageLog("error", "Native storage API was not found", {
+                pdaStorageDefined: typeof PDA_storage !== "undefined",
+                requiredMethod: "PDA_storage.loadAll",
+                action: "Updates are paused; no native data was changed."
+            });
         }
         if (store) {
             try {
                 let values;
                 for (let attempt = 0; attempt < 2; attempt++) {
                     try {
+                        storageLog("info", "Calling PDA_storage.loadAll", {
+                            attempt: attempt + 1,
+                            maximumAttempts: 2,
+                            bridgeReadyEventSeen: pdaBridge.ready
+                        });
                         values = await store.loadAll();
                         if (!values || typeof values !== "object" || Array.isArray(values)) {
                             throw new Error("Invalid native storage response");
                         }
+                        storageLog("info", "PDA_storage.loadAll succeeded", {
+                            attempt: attempt + 1,
+                            recordCount: Object.keys(values).length,
+                            hasOfficialDirectory: Object.prototype.hasOwnProperty.call(values, DIRECTORY_KEY),
+                            hasPendingFactionUpdate: Object.prototype.hasOwnProperty.call(values, SCAN_KEY),
+                            hasFactionSnapshot: Object.prototype.hasOwnProperty.call(values, STORAGE.snapshot)
+                        });
                         break;
-                    } catch (_) {
-                        if (attempt) throw new Error("Native storage unavailable");
+                    } catch (error) {
+                        storageLog(attempt ? "error" : "warn", "PDA_storage.loadAll failed", {
+                            attempt: attempt + 1,
+                            maximumAttempts: 2,
+                            willRetry: !attempt,
+                            retryDelayMs: attempt ? 0 : 300,
+                            failure: safeStorageFailure(error)
+                        });
+                        if (attempt) throw error;
                         await sleep(300);
                     }
                 }
@@ -594,10 +703,14 @@
                 runtime.storageMode = "TornPDA native storage";
                 for (const key of failedStorageKeys) if (key.startsWith("read:")) failedStorageKeys.delete(key);
                 if (!failedStorageKeys.size) runtime.storageError = "";
-            } catch (_) {
+            } catch (error) {
                 runtime.nativeValues = null;
                 runtime.storageMode = "TornPDA storage unavailable";
                 runtime.storageError = "TornPDA storage could not be loaded. Updates are paused to protect saved data.";
+                storageLog("error", "Native persistent-state load failed completely", {
+                    failure: safeStorageFailure(error),
+                    action: "Legacy cached values may be displayed read-only; updates remain paused."
+                });
             }
         }
         const read = async (key, fallback) => runtime.nativeValues
@@ -628,6 +741,14 @@
         liveTeams.data = await read(LIVE_TEAMS_KEY, null);
         if (runtime.config.metric === "factionScore") runtime.config.metric = "score";
         await migrateAttackRankings();
+        storageLog(runtime.storageError ? "warn" : "info", "Persistent-state load finished", {
+            mode: runtime.storageMode,
+            usable: !runtime.storageError,
+            storageError: runtime.storageError || null,
+            snapshotLoaded: Boolean(runtime.snapshot),
+            historyPointsLoaded: runtime.history?.points?.length || 0,
+            officialDirectoryCheckpointLoaded: Boolean(runtime.scan)
+        });
     }
 
     async function migrateAttackRankings() {
@@ -657,11 +778,23 @@
 
     async function persistValues(values) {
         const frozen = JSON.parse(JSON.stringify(values));
+        const records = Object.keys(frozen);
+        const payloadCharacters = JSON.stringify(frozen).length;
         const write = storageWrites.then(async () => {
-                const store = nativeStore();
+            const store = nativeStore();
+            const backend = store ? "PDA_storage.setMany"
+                : typeof GM_setValue === "function" ? "GM_setValue"
+                    : typeof GM !== "undefined" && typeof GM.setValue === "function"
+                        ? "GM.setValue" : "localStorage";
+            storageLog("debug", "Storage write started", {
+                backend, records, recordCount: records.length, payloadCharacters
+            });
             try {
                 if (store) {
                     if (!runtime.nativeValues) throw new Error("Native storage unavailable");
+                    if (typeof store.setMany !== "function") {
+                        throw new Error("PDA_storage.setMany is not available");
+                    }
                     await store.setMany(frozen);
                     Object.assign(runtime.nativeValues, frozen);
                 } else {
@@ -670,9 +803,18 @@
                 }
                 for (const key of Object.keys(frozen)) failedStorageKeys.delete(key);
                 if (!failedStorageKeys.size) runtime.storageError = "";
-            } catch (_) {
+                storageLog("info", "Storage write succeeded", {
+                    backend, records, recordCount: records.length, payloadCharacters
+                });
+            } catch (error) {
                 for (const key of Object.keys(frozen)) failedStorageKeys.add(key);
                 runtime.storageError = "Shared script storage failed or is full. Updates paused; saved progress is retained. Check storage in Settings.";
+                storageLog("error", "Storage write failed", {
+                    backend, records, recordCount: records.length, payloadCharacters,
+                    nativeValuesLoaded: Boolean(runtime.nativeValues),
+                    failure: safeStorageFailure(error),
+                    action: "Updates paused; the in-memory data was not treated as saved."
+                });
                 throw new Error("Script storage unavailable");
             }
         });
@@ -681,22 +823,50 @@
     }
 
     async function readShared(key, fallback = null) {
+        const store = nativeStore();
+        const backend = store ? (typeof store.get === "function"
+            ? "PDA_storage.get" : "PDA_storage.loadAll")
+            : typeof GM_getValue === "function" ? "GM_getValue"
+                : typeof GM !== "undefined" && typeof GM.getValue === "function"
+                    ? "GM.getValue" : "localStorage";
         try {
-            const store = nativeStore();
             if (store) {
                 if (!runtime.nativeValues) throw new Error("Native storage unavailable");
                 const value = typeof store.get === "function" ? await store.get(key, fallback)
                     : (await store.loadAll())[key] ?? fallback;
                 runtime.nativeValues[key] = value;
+                storageLog("debug", "Shared storage read succeeded", {
+                    backend, record: key, found: value !== fallback
+                });
                 return value;
             }
-            if (typeof GM_getValue === "function") return await GM_getValue(key, fallback);
-            if (typeof GM !== "undefined" && typeof GM.getValue === "function") return await GM.getValue(key, fallback);
+            if (typeof GM_getValue === "function") {
+                const value = await GM_getValue(key, fallback);
+                storageLog("debug", "Shared storage read succeeded", {
+                    backend, record: key, found: value !== fallback
+                });
+                return value;
+            }
+            if (typeof GM !== "undefined" && typeof GM.getValue === "function") {
+                const value = await GM.getValue(key, fallback);
+                storageLog("debug", "Shared storage read succeeded", {
+                    backend, record: key, found: value !== fallback
+                });
+                return value;
+            }
             const raw = localStorage.getItem(key);
+            storageLog("debug", "Shared storage read succeeded", {
+                backend, record: key, found: raw !== null
+            });
             return raw === null ? fallback : JSON.parse(raw);
-        } catch (_) {
+        } catch (error) {
             failedStorageKeys.add("read:" + key);
             runtime.storageError = "Shared storage read failed. Updates paused; restore storage and reload to retain saved progress.";
+            storageLog("error", "Shared storage read failed", {
+                backend, record: key, nativeValuesLoaded: Boolean(runtime.nativeValues),
+                failure: safeStorageFailure(error),
+                action: "Updates paused; the cached record was retained."
+            });
             throw new Error("Shared storage unavailable");
         }
     }
@@ -1777,7 +1947,8 @@
             + 'new members and failed checks stay in the update queue. Refresh manually to recheck everyone.</p>'
             + '<button type="button" class="danger" data-action="clear-history">Clear rank history</button></section>'
             + '<section class="tefr-panel"><h3>Diagnostics</h3><p>Open the F12 console and filter for '
-            + '<code>[TEFR]</code> to inspect sanitized scheduling, API, chunk, team-resolution, and mount events.</p>'
+            + '<code>[TEFR]</code> for general events or <code>[TEFR][Storage]</code> for detailed, '
+            + 'credential-safe bridge, load, read, write, recovery, and failure diagnostics.</p>'
             + '<code>/user/basic</code> <code>/faction/basic</code> '
             + '<code>/faction/{id}/basic</code> <code>/faction/{id}/members</code> '
             + '<code>/user/competition</code> <code>/faction/members</code> '
