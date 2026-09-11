@@ -34,7 +34,7 @@ function fixture(responder = () => [], saved = {}) {
     };
     const source = fs.readFileSync(file, "utf8").replace("        VERSION, REQUEST_GAP_MS,",
         "        hooks: { requestJson, liveTeams, refreshLiveTeams, currentTeams, migrateAttackRankings, tabRefreshControl, refreshTab, directory, ff, runtime, loadPersistentState, readShared, loadCompetition, saveCompetitionSort, queueFF, validateFF, setFFKey, refreshVisibleEstimates, loadBSHistory, findFFTargets, directoryRequest, competitionTick, saveExtra, synchronizeDirectoryEvent, competitionView, bsHistoryMarkup, bindHistoryTooltips, STYLE },\n        VERSION, REQUEST_GAP_MS,");
-    vm.runInNewContext(source, context);
+    vm.runInNewContext(source.replace("hooks: {", "hooks: { watchPdaBridge, recoverPdaStorage,"), context);
     const h = context.module.exports.hooks;
     h.runtime.config.tab = "competition";
     h.runtime.apiKey = "main-test-key";
@@ -46,6 +46,76 @@ function fixture(responder = () => [], saved = {}) {
     h.ff.validated = true;
     return { ...h, calls, logs, waits, saved, context, advance(ms) { time += ms; } };
 }
+
+test("late native readiness restores saved index and checkpoint without fallback writes", async () => {
+    const f = fixture(), listeners = new Set();
+    f.watchPdaBridge({
+        addEventListener(name, fn) { listeners.add(fn); },
+        removeEventListener(name, fn) { listeners.delete(fn); }
+    });
+    const d = api.newDirectory([team], now);
+    api.acceptRosterPage(d, 90, 0, page([row(1)]), now, true);
+    const saved = { TEFR_V2_DIRECTORY: api.packDirectory(d),
+        TEFR_V2_PENDING_SCAN: { id: "retained" } };
+    let ready = false, calls = 0, writes = 0;
+    f.context.PDA_storage = {
+        loadAll() { calls++; if (!ready) throw Error("private bridge error"); return structuredClone(saved); },
+        setMany() { writes++; }
+    };
+    const loading = f.loadPersistentState();
+    assert.equal(calls, 0);
+    await loading;
+    assert.equal(calls, 2);
+    assert.ok(f.runtime.storageError);
+    ready = true;
+    f.context.document.visibilityState = "hidden";
+    for (const fn of [...listeners]) fn();
+    await f.recoverPdaStorage();
+    assert.equal(calls, 2);
+    f.context.document.visibilityState = "visible";
+    await Promise.all([f.recoverPdaStorage(), f.recoverPdaStorage()]);
+    assert.equal(calls, 3);
+    assert.equal(f.runtime.storageError, "");
+    assert.equal(f.runtime.scan.id, "retained");
+    assert.equal(f.directory.data.scan.done, true);
+    assert.equal(f.directory.data.players[1].status.state, "Okay");
+    assert.equal(writes, 0);
+    assert.deepEqual(f.saved, {});
+    assert.equal(JSON.stringify(f.logs).includes("private bridge error"), false);
+});
+
+test("readiness event before timeout permits the first native load", async () => {
+    const f = fixture(), listeners = new Set();
+    f.watchPdaBridge({
+        addEventListener(name, fn) { listeners.add(fn); },
+        removeEventListener(name, fn) { listeners.delete(fn); }
+    });
+    let calls = 0, ready = false;
+    f.context.PDA_storage = { loadAll() { calls++; assert.ok(ready); return {}; } };
+    const loading = f.loadPersistentState();
+    assert.equal(calls, 0);
+    ready = true;
+    for (const fn of [...listeners]) fn();
+    await loading;
+    assert.equal(calls, 1);
+    assert.equal(f.runtime.storageError, "");
+});
+
+test("invalid native responses fail closed and transient startup errors retry", async () => {
+    for (const value of [null, [], "invalid"]) {
+        const f = fixture();
+        f.context.PDA_storage = { loadAll() { return value; } };
+        await f.loadPersistentState();
+        assert.ok(f.runtime.storageError);
+        assert.equal(f.runtime.nativeValues, null);
+    }
+    const f = fixture();
+    let calls = 0;
+    f.context.PDA_storage = { loadAll() { if (++calls === 1) throw Error("not ready"); return {}; } };
+    await f.loadPersistentState();
+    assert.equal(calls, 2);
+    assert.equal(f.runtime.storageError, "");
+});
 
 test("bundled seed has 12 teams, 22814 unique players and no invented status", () => {
     const d = api.newDirectory(undefined, now);

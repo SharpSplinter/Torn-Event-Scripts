@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.0
+// @version      1.5.1
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.0";
+    const VERSION = "1.5.1";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -480,6 +480,52 @@
             ? PDA_storage : null;
     }
 
+    const pdaBridge = { ready: false, pending: false, recovering: false, window: null };
+
+    function watchPdaBridge(win) {
+        if (pdaBridge.window === win) return;
+        pdaBridge.window = win;
+        win.addEventListener("flutterInAppWebViewPlatformReady", () => {
+            pdaBridge.ready = true;
+            pdaBridge.pending = true;
+        }, { once: true });
+    }
+
+    async function waitForPdaBridge() {
+        const win = pdaBridge.window;
+        if (!win || pdaBridge.ready) return;
+        await new Promise(resolve => {
+            let timer;
+            const done = () => {
+                clearTimeout(timer);
+                win.removeEventListener("flutterInAppWebViewPlatformReady", done);
+                resolve();
+            };
+            win.addEventListener("flutterInAppWebViewPlatformReady", done, { once: true });
+            timer = setTimeout(done, 1800);
+        });
+    }
+
+    async function recoverPdaStorage() {
+        if (!pdaBridge.pending || pdaBridge.recovering || runtime.resuming
+            || runtime.busy || directory.busy || !pageActive()) return;
+        pdaBridge.pending = false;
+        pdaBridge.recovering = true;
+        runtime.resuming = true;
+        try {
+            await loadPersistentState();
+            if (!runtime.nativeValues || runtime.storageError) return;
+            directory.loaded = false;
+            directory.lastViewedPage = "";
+            directory.displayIds = [];
+            await loadCompetition();
+            render();
+        } finally {
+            runtime.resuming = false;
+            pdaBridge.recovering = false;
+        }
+    }
+
     async function legacyGet(key, fallback) {
         try {
             if (typeof GM_getValue === "function") {
@@ -522,6 +568,7 @@
     }
 
     async function loadPersistentState() {
+        if (nativeStore() || detectedRuntime().startsWith("TornPDA")) await waitForPdaBridge();
         const store = nativeStore();
         if (!store && detectedRuntime().startsWith("TornPDA")) {
             runtime.storageMode = "TornPDA native storage unavailable";
@@ -529,7 +576,21 @@
         }
         if (store) {
             try {
-                runtime.nativeValues = await store.loadAll();
+                let values;
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        values = await store.loadAll();
+                        if (!values || typeof values !== "object" || Array.isArray(values)) {
+                            throw new Error("Invalid native storage response");
+                        }
+                        break;
+                    } catch (_) {
+                        if (attempt) throw new Error("Native storage unavailable");
+                        await sleep(300);
+                    }
+                }
+                runtime.nativeValues = values;
+                pdaBridge.pending = false;
                 runtime.storageMode = "TornPDA native storage";
                 for (const key of failedStorageKeys) if (key.startsWith("read:")) failedStorageKeys.delete(key);
                 if (!failedStorageKeys.size) runtime.storageError = "";
@@ -3208,6 +3269,7 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
     async function bootstrap(win) {
         if (win.top !== win || win.__TEFR_BOOTSTRAPPED__) return;
         win.__TEFR_BOOTSTRAPPED__ = true;
+        watchPdaBridge(win);
         await loadPersistentState();
         await loadCompetition();
         mount(win.document);
@@ -3216,6 +3278,14 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         runtime.tickTimer = setInterval(updateNextSlotText, 30000);
         clearInterval(directory.tick);
         directory.tick = setInterval(() => {
+            if (pdaBridge.pending) {
+                void recoverPdaStorage().then(() => {
+                    if (!pdaBridge.pending && !pdaBridge.recovering && !runtime.storageError) {
+                        return catchUpRefresh("storage-recovery");
+                    }
+                }).catch(() => {});
+                return;
+            }
             const status = runtime.root?.querySelector("[data-live-status]");
             if (status && pageActive()) status.textContent = liveStatus();
             const life = runtime.root?.querySelector("[data-life-status]");
