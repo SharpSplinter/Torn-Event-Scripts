@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.2
+// @version      1.5.3
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.2";
+    const VERSION = "1.5.3";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -38,8 +38,9 @@
     const NOT_PARTICIPATING = "Not Participating";
     const ENROLLMENT_END_MS = Date.UTC(2026, 8, 10, 12);
     const REQUEST_GAP_MS = 1200;
+    const MEMBER_REQUEST_GAP_MS = 900;
     const MEMBER_CHUNK_SIZE = 10;
-    const MEMBER_CHUNK_PAUSE_MS = 10000;
+    const MEMBER_CHUNK_PAUSE_MS = 2000;
     const AUTO_REFRESH_STALE_MS = 30 * 60 * 1000;
     const MAX_HISTORY_POINTS = 1200;
     // BEGIN GENERATED COMPETITION SEED
@@ -231,7 +232,7 @@
                 || !isNonParticipatingTeam(comp.teamName)),
             teamId: comp.teamId, teamName: comp.teamName,
             score: comp.score, attacks: comp.attacks, availability,
-            competitionCheckedAt: comp.active ? checkedAt : 0,
+            competitionCheckedAt: checkedAt,
             factionRank: null, teamRank: null
         };
     }
@@ -248,8 +249,9 @@
 
     function memberNeedsRefresh(previous, asOf, force = false) {
         // Only the 2026 enrollment deadline has been confirmed.
-        return force || !previous || new Date(asOf).getUTCFullYear() !== 2026
-            || asOf < ENROLLMENT_END_MS || previous.participating !== false
+        if (force || !previous || new Date(asOf).getUTCFullYear() !== 2026
+            || previous.participating !== false) return true;
+        return asOf < ENROLLMENT_END_MS
             || !["fresh", "final"].includes(previous.availability)
             || number(previous.competitionCheckedAt) < ENROLLMENT_END_MS;
     }
@@ -944,13 +946,14 @@
         return gmHttpGet(url, headers);
     }
 
-    function requestJson(path, key, params = {}, relevant = () => true) {
+    function requestJson(path, key, params = {}, relevant = () => true,
+        gapMs = REQUEST_GAP_MS) {
         const task = tornRequests.then(async () => {
             requireActivePage();
             if (!relevant()) throw new PausedUpdate();
             if (runtime.tornBlocked) throw new ApiError("Key needs attention", runtime.tornBlocked);
             if (Date.now() < (runtime.tornCooldown || 0)) throw new ApiError("API cooldown", 5);
-            const gap = REQUEST_GAP_MS - (Date.now() - directory.lastRequest);
+            const gap = gapMs - (Date.now() - directory.lastRequest);
             if (gap > 0) await sleep(gap);
             requireActivePage();
             if (!relevant()) throw new PausedUpdate();
@@ -991,7 +994,8 @@
         return data;
     }
 
-    function requestWithRetry(path, key, params, attempts = 3) {
+    function requestWithRetry(path, key, params, attempts = 3,
+        gapMs = REQUEST_GAP_MS) {
         const task = factionRequests.then(async () => {
             requireActivePage();
             const scan = runtime.scan;
@@ -1000,10 +1004,12 @@
                 scan.leaseUntil = Date.now() + 60000;
                 await persistValues({ [SCAN_KEY]: scan });
             }
-            const gap = REQUEST_GAP_MS - (Date.now() - directory.lastRequest);
+            const gap = gapMs - (Date.now() - directory.lastRequest);
             if (gap > 0) await sleep(gap);
             requireActivePage();
-            const data = await requestRetryUncached(path, key, { ...params, timestamp: Math.floor(Date.now() / 1000) }, attempts);
+            const data = await requestRetryUncached(path, key,
+                { ...params, timestamp: Math.floor(Date.now() / 1000) },
+                attempts, gapMs);
             if (scan && runtime.scan === scan) {
                 const safe = Object.fromEntries(Object.entries(data).filter(([name]) =>
                     ["profile", "competition", "members", "elimination", "basic", "id", "name", "tag"].includes(name)));
@@ -1017,7 +1023,8 @@
         return task;
     }
 
-    async function requestRetryUncached(path, key, params, attempts = 3) {
+    async function requestRetryUncached(path, key, params, attempts = 3,
+        gapMs = REQUEST_GAP_MS) {
         let lastError;
         for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
@@ -1026,7 +1033,7 @@
                     runtime.scan.leaseUntil = Date.now() + 60000;
                     await persistValues({ [SCAN_KEY]: runtime.scan });
                 }
-                return await requestJson(path, key, params);
+                return await requestJson(path, key, params, () => true, gapMs);
             } catch (error) {
                 if (error?.paused || runtime.storageError) throw error;
                 lastError = error;
@@ -1209,8 +1216,10 @@
                 }
             });
             const retainedMembers = normalized.length;
-            infoLog("Enrollment refresh queue", {
+            infoLog("Participant verification queue", {
                 queued: otherMembers.length, retainedMembers,
+                currentlyParticipating: otherMembers.filter((member) =>
+                    previousById.get(String(member.id))?.participating).length,
                 enrollmentEnds: formatUtc(ENROLLMENT_END_MS)
             });
             const total = otherMembers.length;
@@ -1237,7 +1246,7 @@
                         + chunk + " of " + chunkTotal);
                     await sleep(MEMBER_CHUNK_PAUSE_MS);
                 }
-                const wait = REQUEST_GAP_MS - (Date.now() - lastStartedAt);
+                const wait = MEMBER_REQUEST_GAP_MS - (Date.now() - lastStartedAt);
                 if (!cached && wait > 0) await sleep(wait);
                 requireActivePage();
                 lastStartedAt = Date.now();
@@ -1247,7 +1256,9 @@
                     const response = await requestWithRetry(
                         endpoint,
                         key,
-                        params
+                        params,
+                        3,
+                        MEMBER_REQUEST_GAP_MS
                     );
                     normalized.push(normalizeMember(member, response, "fresh", runtime.scan.responses[endpoint]?.at || Date.now()));
                     debugLog("Member updated", {
@@ -1928,7 +1939,9 @@
             + "<span><small>Shared across pages</small><b>Same installed script · faction and attack pages</b></span>"
             + (runtime.storageError ? '<span class="bad">' + escapeHtml(runtime.storageError) + '</span>' : "")
             + "<span><small>Member pacing</small><b>" + MEMBER_CHUNK_SIZE
-            + " per chunk · " + Math.round(MEMBER_CHUNK_PAUSE_MS / 1000) + "s pause</b></span>"
+            + " per chunk · " + (MEMBER_REQUEST_GAP_MS / 1000).toFixed(1)
+            + "s/member · " + (MEMBER_CHUNK_PAUSE_MS / 1000).toFixed(1)
+            + "s pause</b></span>"
             + "<span><small>Enrollment deadline</small><b>10 Sep 2026, 12:00 UTC</b></span>"
             + "<span><small>Final nonparticipant records</small><b>"
             + formatNumber(runtime.snapshot?.retainedMembers || 0) + "</b></span>"
@@ -1944,7 +1957,9 @@
             + '<p>Visible official roster pages update on navigation and every 5 seconds. Team standings poll every 3 seconds while shown. All Torn calls share pacing and rate-limit cooldowns; network and provider caching may delay results.</p>'
             + '<p>Hidden members remain in every snapshot. They are checked hourly through enrollment '
             + 'and once more after it closes. Confirmed nonparticipants then use their saved event data; '
-            + 'new members and failed checks stay in the update queue. Refresh manually to recheck everyone.</p>'
+            + 'new members and failed checks stay in the update queue. Every currently participating member '
+            + 'is rechecked each update so anyone who leaves the event is moved to Not Participating. '
+            + 'Refresh manually to recheck everyone.</p>'
             + '<button type="button" class="danger" data-action="clear-history">Clear rank history</button></section>'
             + '<section class="tefr-panel"><h3>Diagnostics</h3><p>Open the F12 console and filter for '
             + '<code>[TEFR]</code> for general events or <code>[TEFR][Storage]</code> for detailed, '
@@ -3491,7 +3506,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         newDirectory, normalizeDirectoryPlayer, nextRosterOffset, acceptRosterPage, hospitalLabel,
         packDirectory, unpackDirectory, reconcileDirectoryCursor, lifeLossState, ELIMINATION_START_MS,
         normalizeEstimate, finderParameters, passesEstimateFilters, sortCompetitionPlayers,
-        VERSION, REQUEST_GAP_MS, MEMBER_CHUNK_SIZE, MEMBER_CHUNK_PAUSE_MS, ENROLLMENT_END_MS,
+        VERSION, REQUEST_GAP_MS, MEMBER_REQUEST_GAP_MS, MEMBER_CHUNK_SIZE,
+        MEMBER_CHUNK_PAUSE_MS, ENROLLMENT_END_MS,
         AUTO_REFRESH_STALE_MS, lastSuccessfulUpdateAt, automaticRefreshDue,
         ordinal, slotAtOrBefore, nextSlot,
         normalizeCompetition, normalizeMember, memberPerformanceCompare,

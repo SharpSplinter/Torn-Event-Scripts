@@ -309,8 +309,9 @@ test("userscript security and TornPDA compatibility invariants", () => {
     assert.equal((source.match(/searchParams\.set\(["']key["']/g) || []).length, 1, "Only the authorized FFScouter query-key exception");
     assert.match(source, /url.searchParams.set\("key", ff.key\)/);
     assert.equal(api.REQUEST_GAP_MS >= 1100, true);
+    assert.equal(api.MEMBER_REQUEST_GAP_MS, 900);
     assert.equal(api.MEMBER_CHUNK_SIZE, 10);
-    assert.equal(api.MEMBER_CHUNK_PAUSE_MS >= 10000, true);
+    assert.equal(api.MEMBER_CHUNK_PAUSE_MS, 2000);
     assert.match(source, /grid-template-columns:repeat\(auto-fit,minmax\(74px,1fr\)\)/);
     assert.match(source, /@match\s+https:\/\/www\.torn\.com\/factions\.php\*/);
     assert.match(source, /content\.querySelector\("#factions"\)/);
@@ -521,14 +522,14 @@ test("leaving during a faction scan checkpoints and resumes without repeating co
     assert.equal(await reload.catchUpRefresh("catch-up"), false);
 });
 
-test("refresh integrates alliance rosters, pacing, late enrollment, and retained final records", async () => {
-    let closed = false, rosterFailure = false;
+test("refresh integrates alliance rosters, faster pacing, withdrawals, and retained final records", async () => {
+    let closed = false, withdrawn = false, rosterFailure = false;
     const ownRoster = Array.from({ length: 11 }, (_, index) => rosterMember(index + 1, "Main " + (index + 1)));
     const sisterRoster = [rosterMember(12, "LateJoiner"), rosterMember(13, "NeverJoins"), ownRoster[0]];
     const competition = (id) => ({
         competition: {
-            name: "Elimination", team_id: id === 13 || id === 12 && !closed ? null : 7,
-            team: id === 13 || id === 12 && !closed ? "Unknown" : "Loose Cannons",
+            name: "Elimination", team_id: id === 13 || id === 12 && (!closed || withdrawn) ? null : 7,
+            team: id === 13 || id === 12 && (!closed || withdrawn) ? "Unknown" : "Loose Cannons",
             score: id === 13 ? 0 : id, attacks: 1
         }
     });
@@ -556,9 +557,10 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     const calls = fixture.calls.filter((call) => /^\/user\/\d+\/competition$/.test(call.endpoint));
     assert.equal(calls.length, 12);
     assert.equal(calls.some((call) => call.endpoint === "/user/1/competition"), false);
-    assert.ok(calls.slice(1).every((call, index) => call.at - calls[index].at >= 1200));
-    assert.ok(calls[10].at - calls[9].at >= 10000);
-    assert.equal(fixture.waits.filter((ms) => ms === 10000).length, 1);
+    assert.ok(calls.slice(1).every((call, index) =>
+        call.at - calls[index].at >= api.MEMBER_REQUEST_GAP_MS));
+    assert.ok(calls[10].at - calls[9].at >= api.MEMBER_CHUNK_PAUSE_MS);
+    assert.equal(fixture.waits.filter((ms) => ms === api.MEMBER_CHUNK_PAUSE_MS).length, 1);
 
     closed = true;
     fixture.setNow("2026-09-10T12:10:00Z");
@@ -567,9 +569,11 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     assert.equal(runtime.snapshot.members.find((member) => member.id === 13).availability, "fresh");
     fixture.calls.length = 0;
     fixture.setNow("2026-09-10T13:10:00Z");
+    withdrawn = true;
     assert.equal(await fixture.refreshData("scheduled"), true);
     assert.equal(fixture.calls.some((call) => call.endpoint === "/user/13/competition"), false);
     assert.equal(fixture.calls.some((call) => call.endpoint === "/user/12/competition"), true);
+    assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, false);
     assert.equal(runtime.snapshot.members.length, 13);
     assert.equal(runtime.snapshot.failedMembers, 0);
     assert.equal(runtime.snapshot.retainedMembers, 1);
@@ -606,12 +610,13 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
         runtime.config.tab = tab;
         fixture.render();
         assert.doesNotMatch(runtime.root.innerHTML, /NeverJoins/);
-        assert.match(runtime.root.innerHTML, /LateJoiner/);
+        assert.doesNotMatch(runtime.root.innerHTML, /LateJoiner/);
     }
     runtime.config.tab = "ranking";
     fixture.render();
     buttons.visibility();
     assert.match(runtime.root.innerHTML, /NeverJoins/);
+    assert.match(runtime.root.innerHTML, /LateJoiner/);
     assert.match(runtime.root.innerHTML, /Alliance Rank:/);
     assert.match(runtime.root.innerHTML, /Faction Rank:/);
     buttons.faction();
@@ -628,12 +633,12 @@ test("refresh integrates alliance rosters, pacing, late enrollment, and retained
     fixture.render();
     for (const [label, value] of [
         ["Faction Attacks", 11], ["Faction Members", 11],
-        ["Alliance Attacks", 12], ["Alliance Members", 12]
+        ["Alliance Attacks", 11], ["Alliance Members", 11]
     ]) {
         assert.ok(runtime.root.innerHTML.includes("<small>" + label + "</small><b>" + value + "</b>"), label);
     }
     buttons.visibility();
-    assert.ok(runtime.root.innerHTML.includes("<small>Alliance Members</small><b>12</b>"));
+    assert.ok(runtime.root.innerHTML.includes("<small>Alliance Members</small><b>11</b>"));
     runtime.config.tab = "settings";
     fixture.render();
     assert.match(runtime.root.innerHTML, /value="44817"/);
