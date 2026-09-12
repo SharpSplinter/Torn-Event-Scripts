@@ -522,6 +522,28 @@ test("leaving during a faction scan checkpoints and resumes without repeating co
     assert.equal(await reload.catchUpRefresh("catch-up"), false);
 });
 
+test("dropout tracking reconstructs former participation and keeps peak attacks", () => {
+    const history = {
+        points: [{
+            slot: 1, completedAt: 2,
+            members: { "9": [1, 1, 0, 14, 7, "Loose Cannons", 10, 1] }
+        }]
+    };
+    const current = api.normalizeMember(rosterMember(9, "Former Player"), {
+        competition: {
+            name: "Elimination", team_id: null,
+            team: "Unknown", score: 0, attacks: 0
+        }
+    }, "fresh", 5);
+    const previous = { ...current, participating: false, attacks: 0 };
+    const result = api.trackParticipation(current, previous,
+        api.participationHistoryById(history).get("9"), 5);
+    assert.equal(result.droppedOut, true);
+    assert.equal(result.attacks, 14);
+    assert.equal(result.formerTeamId, 7);
+    assert.equal(result.formerTeamName, "Loose Cannons");
+});
+
 test("refresh integrates alliance rosters, faster pacing, withdrawals, and retained final records", async () => {
     let closed = false, withdrawn = false, rosterFailure = false;
     const ownRoster = Array.from({ length: 11 }, (_, index) => rosterMember(index + 1, "Main " + (index + 1)));
@@ -530,7 +552,7 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
         competition: {
             name: "Elimination", team_id: id === 13 || id === 12 && (!closed || withdrawn) ? null : 7,
             team: id === 13 || id === 12 && (!closed || withdrawn) ? "Unknown" : "Loose Cannons",
-            score: id === 13 ? 0 : id, attacks: 1
+            score: id === 13 ? 0 : id, attacks: id === 12 && withdrawn ? 0 : 1
         }
     });
     const fixture = fixtureRuntime((endpoint) => {
@@ -573,7 +595,13 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     assert.equal(await fixture.refreshData("scheduled"), true);
     assert.equal(fixture.calls.some((call) => call.endpoint === "/user/13/competition"), false);
     assert.equal(fixture.calls.some((call) => call.endpoint === "/user/12/competition"), true);
-    assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, false);
+    const dropout = runtime.snapshot.members.find((member) => member.id === 12);
+    assert.equal(dropout.participating, false);
+    assert.equal(dropout.droppedOut, true);
+    assert.equal(dropout.attacks, 1);
+    assert.equal(dropout.formerTeamName, "Loose Cannons");
+    assert.ok(Number.isInteger(dropout.allianceRank));
+    assert.ok(Number.isInteger(dropout.factionRank));
     assert.equal(runtime.snapshot.members.length, 13);
     assert.equal(runtime.snapshot.failedMembers, 0);
     assert.equal(runtime.snapshot.retainedMembers, 1);
@@ -624,6 +652,14 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     assert.equal(runtime.config.faction, "10");
     buttons.alliance();
     assert.equal(runtime.config.faction, "all");
+    runtime.config.showNonParticipants = false;
+    runtime.config.tab = "dropped";
+    fixture.render();
+    assert.match(runtime.root.innerHTML, /1 dropped-out member/);
+    assert.match(runtime.root.innerHTML, /LateJoiner/);
+    assert.match(runtime.root.innerHTML, /Former team: Loose Cannons/);
+    assert.doesNotMatch(runtime.root.innerHTML, /NeverJoins/);
+    assert.match(runtime.root.innerHTML, /Alliance rank/);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(fixture.saved.TEFR_V1_CONFIG.showNonParticipants, true);
     runtime.config.tab = "overview";

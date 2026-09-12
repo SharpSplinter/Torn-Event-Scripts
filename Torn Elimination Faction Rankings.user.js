@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.3
+// @version      1.5.4
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.3";
+    const VERSION = "1.5.4";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -234,6 +234,55 @@
             score: comp.score, attacks: comp.attacks, availability,
             competitionCheckedAt: checkedAt,
             factionRank: null, teamRank: null
+        };
+    }
+
+    function participationHistoryById(history) {
+        const result = new Map();
+        for (const point of history?.points || []) {
+            for (const [id, values] of Object.entries(point.members || {})) {
+                if (isNonParticipatingTeam(values?.[5])) continue;
+                const previous = result.get(id);
+                result.set(id, {
+                    teamId: nullableNumber(values[4]),
+                    teamName: String(values[5] || ""),
+                    attacks: Math.max(number(values[3]), number(previous?.attacks)),
+                    at: number(point.completedAt || point.slot)
+                });
+            }
+        }
+        return result;
+    }
+
+    function trackParticipation(current, previous, historical, checkedAt = Date.now()) {
+        if (current.participating) {
+            return {
+                ...current, droppedOut: false, droppedOutAt: 0,
+                formerTeamId: null, formerTeamName: ""
+            };
+        }
+        const former = previous?.droppedOut ? {
+            teamId: previous.formerTeamId,
+            teamName: previous.formerTeamName,
+            attacks: previous.attacks,
+            at: previous.droppedOutAt
+        } : previous?.participating ? {
+            teamId: previous.teamId,
+            teamName: previous.teamName,
+            attacks: previous.attacks,
+            at: checkedAt
+        } : historical;
+        if (!former || isNonParticipatingTeam(former.teamName)) {
+            return { ...current, droppedOut: false, droppedOutAt: 0 };
+        }
+        return {
+            ...current,
+            droppedOut: true,
+            droppedOutAt: number(previous?.droppedOutAt) || number(checkedAt),
+            formerTeamId: nullableNumber(former.teamId),
+            formerTeamName: String(former.teamName || "Former team"),
+            attacks: Math.max(number(current.attacks), number(previous?.attacks),
+                number(former.attacks))
         };
     }
 
@@ -1072,12 +1121,20 @@
         if (!previous || previous.availability === "unavailable") {
             return normalizeMember(member, null, "unavailable");
         }
-        return normalizeMember(member, {
+        const retained = normalizeMember(member, {
             competition: {
                 name: "Elimination", team_id: previous.teamId,
                 team: previous.teamName, score: previous.score, attacks: previous.attacks
             }
         }, availability, number(previous.competitionCheckedAt));
+        return {
+            ...retained,
+            droppedOut: Boolean(previous.droppedOut),
+            droppedOutAt: number(previous.droppedOutAt),
+            formerTeamId: nullableNumber(previous.formerTeamId),
+            formerTeamName: String(previous.formerTeamName || ""),
+            attacks: Math.max(number(retained.attacks), number(previous.attacks))
+        };
     }
 
     function lastSuccessfulUpdateAt(snapshot, config) {
@@ -1205,6 +1262,8 @@
             const previousById = new Map(
                 (priorSnapshot?.members || []).map((member) => [String(member.id), member])
             );
+            const historicalParticipation = runtime.history.eventKey === keyForEvent
+                ? participationHistoryById(runtime.history) : new Map();
             const normalized = [];
             const otherMembers = [];
             roster.filter((member) => number(member.id) !== profile.id).forEach((member) => {
@@ -1212,7 +1271,9 @@
                 if (memberNeedsRefresh(previous, timestamp * 1000, reason === "manual")) {
                     otherMembers.push(member);
                 } else {
-                    normalized.push(priorMember(member, previous, "final"));
+                    const retained = priorMember(member, previous, "final");
+                    normalized.push(trackParticipation(retained, previous,
+                        historicalParticipation.get(String(member.id)), timestamp * 1000));
                 }
             });
             const retainedMembers = normalized.length;
@@ -1226,7 +1287,15 @@
             const chunkTotal = Math.ceil(total / MEMBER_CHUNK_SIZE);
             if (profile.id) {
                 const own = roster.find((member) => number(member.id) === profile.id);
-                if (own) normalized.push(normalizeMember(own, personalRaw, "fresh", timestamp * 1000));
+                if (own) {
+                    const previous = previousById.get(String(own.id));
+                    normalized.push(trackParticipation(
+                        normalizeMember(own, personalRaw, "fresh", timestamp * 1000),
+                        previous,
+                        historicalParticipation.get(String(own.id)),
+                        timestamp * 1000
+                    ));
+                }
             }
 
             let lastStartedAt = Date.now();
@@ -1260,7 +1329,13 @@
                         3,
                         MEMBER_REQUEST_GAP_MS
                     );
-                    normalized.push(normalizeMember(member, response, "fresh", runtime.scan.responses[endpoint]?.at || Date.now()));
+                    const checkedAt = runtime.scan.responses[endpoint]?.at || Date.now();
+                    normalized.push(trackParticipation(
+                        normalizeMember(member, response, "fresh", checkedAt),
+                        previousById.get(String(member.id)),
+                        historicalParticipation.get(String(member.id)),
+                        checkedAt
+                    ));
                     debugLog("Member updated", {
                         id: number(member.id), chunk, completed: index + 1, total
                     });
@@ -1270,7 +1345,12 @@
                         id: number(member.id), chunk,
                         code: error?.code ?? null, status: error?.status || 0
                     });
-                    normalized.push(priorMember(member, previousById.get(String(member.id))));
+                    const previous = previousById.get(String(member.id));
+                    const retained = priorMember(member, previous);
+                    normalized.push(previous?.participating === false
+                        ? trackParticipation(retained, previous,
+                            historicalParticipation.get(String(member.id)), timestamp * 1000)
+                        : retained);
                 }
                 updateProgress(index + 1, total, "chunk " + chunk + " of "
                     + chunkTotal + " · " + String(member.name || ""));
@@ -1278,7 +1358,12 @@
 
             roster.filter((member) => !normalized.some((row) => row.id === number(member.id)))
                 .forEach((member) => {
-                    normalized.push(priorMember(member, previousById.get(String(member.id))));
+                    const previous = previousById.get(String(member.id));
+                    const retained = priorMember(member, previous);
+                    normalized.push(previous?.participating === false
+                        ? trackParticipation(retained, previous,
+                            historicalParticipation.get(String(member.id)), timestamp * 1000)
+                        : retained);
                 });
             const resolved = resolveMemberTeams(normalized, globalTeams);
             const resolvedByName = resolved.filter((member, index) =>
@@ -1602,9 +1687,10 @@
 
     function tabRefreshControl() {
         const tab = runtime.config.tab;
-        if (!["overview", "ranking", "teams"].includes(tab)) return "";
+        if (!["overview", "ranking", "dropped", "teams"].includes(tab)) return "";
         const label = tab === "overview" ? "Refresh overview teams"
-            : tab === "ranking" ? "Refresh " + rankingLabel().toLowerCase() + " ranking" : "Refresh teams & members";
+            : tab === "ranking" ? "Refresh " + rankingLabel().toLowerCase() + " ranking"
+                : tab === "dropped" ? "Refresh dropped-out records" : "Refresh teams & members";
         return '<div class="tefr-panel-heading tefr-result-count"><button type="button" data-refresh-tab'
             + (runtime.busy || runtime.tabRefreshing ? " disabled" : "") + ">" + label + "</button>"
             + "<small>Member ranks use total attacks only. Tickets belong to the whole team.</small></div>";
@@ -1717,6 +1803,17 @@
             : member.availability === "fresh" ? ""
             : '<span class="tefr-stale">' + (member.availability === "stale" ? "Stale" : "Unavailable") + "</span>";
         const teamRank = member.teamRank ? ordinal(member.teamRank) : "-";
+        const teamLine = member.droppedOut
+            ? '<span><i style="background:' + teamColor(member.formerTeamId ?? member.formerTeamName)
+                + '"></i>Dropped out · Former team: ' + escapeHtml(member.formerTeamName || "Unknown")
+                + "</span>"
+            : '<span><i style="background:' + teamColor(teamKey(member)) + '"></i>'
+                + escapeHtml(member.teamName) + " · Team " + teamRank + "</span>";
+        const firstMetric = member.droppedOut
+            ? "<b>" + ordinal(member.allianceRank ?? member.factionRank)
+                + "<small>Alliance rank</small></b>"
+            : "<b>" + formatNumber(memberTickets(member))
+                + "<small>Team tickets</small></b>";
         return '<article class="tefr-member-card' + (member.id === runtime.snapshot?.profile?.id ? " is-me" : "")
             + '" data-member-card data-search="' + escapeHtml((member.name + " " + member.id).toLowerCase())
             + '" data-team="' + escapeHtml(teamKey(member))
@@ -1725,15 +1822,14 @@
             + '<div class="tefr-rank-badge" title="' + rankLabel() + '">' + ordinal(displayRank(member)) + '</div>'
             + '<div class="tefr-member-main"><a href="https://www.torn.com/profiles.php?XID='
             + encodeURIComponent(member.id) + '" target="_blank" rel="noopener noreferrer">'
-            + escapeHtml(member.name) + " [" + member.id + "]</a><span><i style=\"background:"
-            + teamColor(teamKey(member)) + '"></i>' + escapeHtml(member.teamName) + " · Team " + teamRank
-            + '</span><span>Faction: ' + escapeHtml(factionLabel(member))
+            + escapeHtml(member.name) + " [" + member.id + "]</a>" + teamLine
+            + '<span>Faction: ' + escapeHtml(factionLabel(member))
             + (member.factionId ? ' [' + member.factionId + ']' : "")
             + (member.rosterStale ? ' · Roster stale' : "")
             + '</span><span>Alliance Rank: <b>' + ordinal(member.allianceRank ?? member.factionRank)
             + '</b> · Faction Rank: <b>' + ordinal(member.factionRank) + '</b>'
-            + "</span></div><div class=\"tefr-member-metrics\"><b>" + formatNumber(memberTickets(member))
-            + "<small>Team tickets</small></b><b>" + formatNumber(member.attacks)
+            + '</span></div><div class="tefr-member-metrics">' + firstMetric
+            + "<b>" + formatNumber(member.attacks)
             + "<small>Attacks</small></b><b class=\"" + movement.tone + "\">" + movement.label
             + "<small>Move</small></b></div>" + availability
             + '<details><summary>Details &amp; hourly rank history</summary><div class="tefr-details-grid">'
@@ -1745,6 +1841,9 @@
             + "<span><small>Last action</small><b>" + escapeHtml(member.lastAction?.relative || "-") + "</b></span>"
             + "<span><small>Event last checked</small><b>"
             + formatUtc(member.competitionCheckedAt) + "</b></span>"
+            + (member.droppedOut ? "<span><small>Dropped out detected</small><b>"
+                + formatUtc(member.droppedOutAt) + "</b></span><span><small>Former team</small><b>"
+                + escapeHtml(member.formerTeamName || "-") + "</b></span>" : "")
             + "</div>" + rankSparkline(member.id) + "</details></article>";
     }
 
@@ -1792,6 +1891,24 @@
             + '<div class="tefr-member-list">' + members.map(memberCard).join("") + "</div>"
             + (!members.length ? '<div class="tefr-empty">No participating members yet. '
                 + 'Use Show Not Participating to view the roster.</div>' : "");
+    }
+
+    function droppedOutView() {
+        const roster = runtime.snapshot?.members || [];
+        if (!roster.length) return '<div class="tefr-empty">Dropout rankings are not available yet.</div>';
+        const members = roster.filter((member) => member.droppedOut);
+        return rankScopeControl()
+            + '<div class="tefr-notice"><b>' + members.length + ' dropped-out member'
+            + (members.length === 1 ? "" : "s") + '</b> · Attack totals and former teams are retained. '
+            + 'Alliance and faction ranks continue to compare them against all ' + roster.length
+            + ' tracked members.</div>'
+            + '<div class="tefr-toolbar"><label><span>Search</span><input data-role="search" type="search" '
+            + 'placeholder="Player name or ID" value="' + escapeHtml(runtime.config.search) + '"></label>'
+            + '<label><span>Faction</span><select data-role="faction-filter">'
+            + factionOptions() + "</select></label></div>"
+            + '<div class="tefr-result-count" data-role="result-count"></div>'
+            + (members.length ? '<div class="tefr-member-list">' + members.map(memberCard).join("")
+                + "</div>" : '<div class="tefr-empty">No faction or alliance members have been detected leaving the event.</div>');
     }
 
     function groupedTeamsView() {
@@ -1973,6 +2090,7 @@
     function currentView() {
         if (runtime.config.tab === "competition") return competitionView();
         if (runtime.config.tab === "ranking") return rankingView();
+        if (runtime.config.tab === "dropped") return droppedOutView();
         if (runtime.config.tab === "teams") return groupedTeamsView();
         if (runtime.config.tab === "trends") return trendsView();
         if (runtime.config.tab === "settings") return settingsView();
@@ -2013,7 +2131,8 @@
         if (!runtime.root) return;
         const tabs = [
             ["overview", "Overview"], ["ranking", rankingLabel() + " Ranking"],
-            ["teams", "Teams"], ["trends", "Trends"], ["competition", "Competition Players"], ["settings", "Settings"]
+            ["teams", "Teams"], ["dropped", "Dropped Out"], ["trends", "Trends"],
+            ["competition", "Competition Players"], ["settings", "Settings"]
         ];
         runtime.root.className = "tefr-root" + (detectedRuntime().startsWith("TornPDA") ? " is-pda" : "")
             + (runtime.config.collapsed ? " is-collapsed" : "")
@@ -2040,7 +2159,7 @@
             + tabs.map(([id, label]) => '<button type="button" data-tab="' + id + '"'
                 + (runtime.config.tab === id ? ' class="active" aria-current="page"' : "")
             + ">" + label + "</button>").join("") + '</nav><main class="tefr-view" tabindex="0" aria-label="Scrollable dashboard content">'
-            + (runtime.config.tab === "competition" ? "" : visibilityControl())
+            + (["competition", "dropped"].includes(runtime.config.tab) ? "" : visibilityControl())
             + (runtime.error ? '<div class="tefr-notice error">' + escapeHtml(runtime.error) + "</div>" : "")
             + (runtime.warning ? '<div class="tefr-notice warn">' + escapeHtml(runtime.warning) + "</div>" : "")
             + tabRefreshControl() + currentView() + "</main></div>";
@@ -2050,20 +2169,25 @@
     }
 
     function applyMemberFilters() {
-        if (!runtime.root || runtime.config.tab !== "ranking") return;
+        if (!runtime.root || !["ranking", "dropped"].includes(runtime.config.tab)) return;
         const query = String(runtime.config.search || "").trim().toLowerCase();
+        const droppedView = runtime.config.tab === "dropped";
         let shown = 0;
         runtime.root.querySelectorAll("[data-member-card]").forEach((card) => {
             const matches = (!query || card.dataset.search.includes(query))
-                && (runtime.config.team === "all" || card.dataset.team === String(runtime.config.team))
                 && (runtime.config.faction === "all" || card.dataset.faction === runtime.config.faction)
-                && (runtime.config.participation === "all"
+                && (droppedView || runtime.config.team === "all"
+                    || card.dataset.team === String(runtime.config.team))
+                && (droppedView || runtime.config.participation === "all"
                     || card.dataset.participating === runtime.config.participation);
             card.hidden = !matches;
             if (matches) shown += 1;
         });
         const count = runtime.root.querySelector("[data-role='result-count']");
-        if (count) count.textContent = shown + " of " + (runtime.snapshot?.members?.length || 0) + " members";
+        const total = droppedView
+            ? (runtime.snapshot?.members || []).filter((member) => member.droppedOut).length
+            : runtime.snapshot?.members?.length || 0;
+        if (count) count.textContent = shown + " of " + total + " members";
     }
 
     function bindEvents() {
@@ -2228,7 +2352,7 @@
 #tefr-root .tefr-header-actions button{min-height:26px;padding:3px 6px;font-size:10px}
 #tefr-root .tefr-public-badge{width:auto;justify-self:start;order:0;font-size:9px;padding:3px 6px}
 #tefr-root>.tefr-body{padding:5px}
-#tefr-root .tefr-tabs{grid-template-columns:repeat(3,minmax(0,1fr));gap:3px;margin-bottom:5px}
+#tefr-root .tefr-tabs{grid-template-columns:repeat(4,minmax(0,1fr));gap:3px;margin-bottom:5px}
 #tefr-root .tefr-tabs button{font-size:10px;min-height:28px;padding:3px 4px;line-height:1.15}
 #tefr-root .tefr-cp-subtabs button{min-height:28px;font-size:10px;padding:3px 5px}
 @supports(height:100dvh){#tefr-root{max-height:min(calc(100dvh - 16px),1120px)}}
@@ -3510,7 +3634,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         MEMBER_CHUNK_PAUSE_MS, ENROLLMENT_END_MS,
         AUTO_REFRESH_STALE_MS, lastSuccessfulUpdateAt, automaticRefreshDue,
         ordinal, slotAtOrBefore, nextSlot,
-        normalizeCompetition, normalizeMember, memberPerformanceCompare,
+        normalizeCompetition, normalizeMember, participationHistoryById, trackParticipation,
+        memberPerformanceCompare,
         memberNeedsRefresh, priorMember, visibleMembers, withNonParticipantVisibility,
         parseFactionIds, normalizeFaction, factionLabel, mergeFactionRosters,
         pointRank,
