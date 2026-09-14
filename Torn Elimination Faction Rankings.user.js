@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.6.1
+// @version      1.7.0
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.6.1";
+    const VERSION = "1.7.0";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -484,6 +484,12 @@
         if (!team || team.eliminated) return false;
         const lives = nullableNumber(team.lives);
         return lives === null || lives > 0;
+    }
+
+    function teamAtRisk(team) {
+        if (!team || team.eliminated) return false;
+        const lives = nullableNumber(team.lives);
+        return lives !== null && lives > 0 && lives <= 2;
     }
 
     function memberNeedsRefresh(previous, asOf, force = false, activeTeams = null) {
@@ -2279,6 +2285,82 @@
             + '<details><summary>Tickets and life-loss rules</summary><p>From 11 September 2026, 12:00 TCT, the lowest team loses a life every 15 minutes. Ties: fewest tickets, fewest wins, most losses, then fewest lives. A team at zero lives is eliminated and its tickets leave circulation. No new tickets are created. One surviving team wins. Risk is based on the latest API snapshot; life losses are never simulated.</p></details></section>';
     }
 
+    function slugifyExportName(value) {
+        return String(value || "").toLowerCase().trim()
+            .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "export";
+    }
+
+    function exportYear() {
+        return new Date().getUTCFullYear();
+    }
+
+    function downloadJson(filename, rows) {
+        try {
+            const blob = new Blob([JSON.stringify(rows, null, 2)], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url; link.download = filename; link.style.display = "none";
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            return true;
+        } catch (error) {
+            infoLog("Export download failed", { filename, message: error?.message });
+            return false;
+        }
+    }
+
+    // Shared row shape for every export button: id / name / attacks / team / status.
+    function exportDirectoryRow(player, teams) {
+        const team = (teams || []).find(t => t.id === player.teamId);
+        return { id: player.id, name: player.name, attacks: number(player.attacks),
+            team: team ? team.name : "Not Participating",
+            status: team && teamIsActive(team) ? "Active" : "Dropped Out" };
+    }
+
+    function exportDirectoryTeam(teamId) {
+        const d = directory.data;
+        if (!d) return [];
+        return Object.values(d.players).filter(p => p.teamId === teamId)
+            .map(p => exportDirectoryRow(p, d.teams))
+            .sort((a, b) => b.attacks - a.attacks || a.name.localeCompare(b.name));
+    }
+
+    function exportDirectoryMaster() {
+        const d = directory.data;
+        if (!d) return [];
+        return Object.values(d.players).map(p => exportDirectoryRow(p, d.teams))
+            .sort((a, b) => b.attacks - a.attacks || a.name.localeCompare(b.name));
+    }
+
+    function exportFactionRoster() {
+        return (runtime.snapshot?.members || []).map(member => ({
+            id: member.id, name: member.name, attacks: number(member.attacks),
+            team: member.participating ? member.teamName : NOT_PARTICIPATING,
+            status: member.participating && !member.droppedOut ? "Active" : "Dropped Out"
+        })).sort((a, b) => b.attacks - a.attacks || a.name.localeCompare(b.name));
+    }
+
+    function exportsView() {
+        const teams = [...(directory.catalog?.teams || directory.data?.teams || [])].sort((a, b) => a.id - b.id);
+        const ownFactionName = runtime.snapshot?.factions?.find(f => f.own)?.name || "faction-alliance";
+        return '<section class="tefr-panel"><h3>Exports</h3>'
+            + '<p>Save the current cached snapshot as JSON files. Each row matches '
+            + '<code>{ id, name, attacks, team, status }</code>, with status of Active or Dropped Out.</p>'
+            + '<div class="tefr-export-group"><h4>Team(s)</h4><div class="tefr-export-buttons">'
+            + (teams.length ? teams.map(team => '<button type="button" data-export="team" data-export-id="'
+                + team.id + '">' + escapeHtml(team.name) + '</button>').join("")
+                : '<small>No official teams indexed yet. Open Competition Players first.</small>')
+            + '</div></div>'
+            + '<div class="tefr-export-group"><h4>Faction / Alliance</h4><div class="tefr-export-buttons">'
+            + '<button type="button" data-export="faction">Export tracked roster (' + escapeHtml(ownFactionName) + ')</button>'
+            + '</div></div>'
+            + '<div class="tefr-export-group"><h4>Master Competition</h4><div class="tefr-export-buttons">'
+            + '<button type="button" data-export="master">Export all teams (master index)</button>'
+            + '</div></div></section>';
+    }
+
     function settingsView() {
         const factionSetup = '<section class="tefr-panel"><h3>Sister / alliance factions</h3>'
             + '<div class="tefr-key-row"><label><span>Faction IDs (comma-separated)</span>'
@@ -2353,7 +2435,8 @@
             + '<code>/user/basic</code> <code>/faction/basic</code> '
             + '<code>/faction/{id}/basic</code> <code>/faction/{id}/members</code> '
             + '<code>/user/competition</code> <code>/faction/members</code> '
-            + "<code>/user/{id}/competition</code> <code>/torn/elimination</code></section></div>";
+            + "<code>/user/{id}/competition</code> <code>/torn/elimination</code></section>"
+            + exportsView() + "</div>";
     }
 
     function currentView() {
@@ -2575,6 +2658,24 @@
             runtime.status = "Rank history cleared.";
             render();
         });
+        runtime.root.querySelectorAll("[data-export]").forEach((button) => {
+            button.addEventListener("click", () => {
+                const year = exportYear();
+                if (button.dataset.export === "team") {
+                    const teamId = Number(button.dataset.exportId);
+                    const team = (directory.catalog?.teams || directory.data?.teams || [])
+                        .find(t => t.id === teamId);
+                    downloadJson("torn-elimination-" + slugifyExportName(team?.name) + "-" + year + ".json",
+                        exportDirectoryTeam(teamId));
+                } else if (button.dataset.export === "faction") {
+                    const ownFactionName = runtime.snapshot?.factions?.find(f => f.own)?.name || "faction-alliance";
+                    downloadJson("torn-elimination-" + slugifyExportName(ownFactionName) + "-" + year + ".json",
+                        exportFactionRoster());
+                } else if (button.dataset.export === "master") {
+                    downloadJson("torn-elimination-master-" + year + ".json", exportDirectoryMaster());
+                }
+            });
+        });
     }
 
     function updateNextSlotText() {
@@ -2676,6 +2777,7 @@
 .tefr-member-list{display:grid;gap:5px}.tefr-member-card{display:grid;grid-template-columns:52px minmax(130px,1fr) minmax(190px,auto) auto;gap:7px;align-items:center;padding:6px}.tefr-member-card.is-me{border-color:var(--accent);box-shadow:inset 3px 0 var(--accent)}.tefr-member-card[hidden]{display:none}.tefr-member-main{min-width:0}.tefr-member-main a{display:block;color:var(--text);font-weight:800;text-decoration:none;overflow-wrap:anywhere}.tefr-member-main span{display:block;color:var(--muted);font-size:11px;overflow-wrap:anywhere}.tefr-member-metrics{display:grid;grid-template-columns:repeat(3,minmax(52px,1fr));gap:4px;text-align:right}.tefr-member-metrics b{font-size:13px}.tefr-stale{color:var(--warn);font-size:10px}.tefr-member-card details{grid-column:2/-1}.tefr-member-card summary{color:var(--muted);cursor:pointer;padding:2px}.tefr-details-grid,.tefr-settings-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:5px;margin:5px 0}.tefr-details-grid span,.tefr-settings-grid span{background:var(--panel2);padding:5px;border-radius:4px}
 .tefr-team-groups{display:grid;gap:8px}.tefr-team-group{border-top:3px solid var(--team);padding:7px}.tefr-team-group>header{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px}.tefr-team-group>header>div{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.tefr-team-group .tefr-team-dot{background:var(--team);margin:0}.tefr-team-group header small{color:var(--muted)}.tefr-team-group>header>div:last-child b{background:var(--panel2);padding:3px 6px;border-radius:4px}.tefr-chart{width:100%;overflow:hidden}.tefr-chart svg{display:block;width:100%;max-height:280px}.tefr-legend{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:5px}.tefr-legend span{font-size:10px;color:var(--muted)}.tefr-legend i{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}.tefr-chart-note{color:var(--muted);font-size:10px;text-align:center}
 .tefr-settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.tefr-settings .tefr-panel{margin:0}.tefr-settings .tefr-panel:last-child{grid-column:1/-1}.tefr-public{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px}.tefr-public span,.tefr-settings p{color:var(--muted)}.tefr-key-row{display:grid;grid-template-columns:minmax(160px,1fr) auto auto;gap:6px;align-items:end}.tefr-root button.danger{border-color:#7c4545;color:#ffabab}.tefr-settings code{display:inline-block;background:#0e1920;color:#b9d6e5;padding:4px 6px;margin:2px;border-radius:4px;overflow-wrap:anywhere}
+.tefr-export-group{margin-top:8px}.tefr-export-group h4{margin:0 0 6px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}.tefr-export-buttons{display:flex;flex-wrap:wrap;gap:6px}.tefr-export-buttons button{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 .tefr-root button[aria-pressed="true"]{background:var(--accent);color:#092019;font-weight:800}.tefr-result-count button{max-width:100%;white-space:normal;overflow-wrap:anywhere}.tefr-settings-grid b{overflow-wrap:anywhere}.tefr-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}
 #tefr-root{display:flex;flex-direction:column;max-height:min(70vh,700px)}
 #tefr-root>.tefr-header{flex:0 0 auto}
@@ -2725,6 +2827,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             id: t.id, name: t.name, participants: t.participants ?? t.rows?.length ?? 0,
             eliminated: Boolean(t.eliminated), lives: nullableNumber(t.lives)
         })), players: {}, pages: {}, officialOpen: false, completedAt: 0,
+        // finalSnapshots tracks the full-roster refresh pass triggered once a team drops to 2 lives.
+        finalSnapshots: {},
         scan: { team: 0, offset: 0, pages: 0, paused: false, retryAt: 0, done: false } };
         if (year === COMPETITION_SEED.year) {
             for (const t of COMPETITION_SEED.teams) {
@@ -2789,7 +2893,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
 
     function packDirectory(data) {
         return { schema: 3, eventKey: data.eventKey, teams: data.teams, pages: data.pages,
-            scan: data.scan, officialOpen: data.officialOpen, completedAt: data.completedAt, savedAt: Date.now(),
+            scan: data.scan, officialOpen: data.officialOpen, completedAt: data.completedAt,
+            finalSnapshots: data.finalSnapshots || {}, savedAt: Date.now(),
             rows: Object.values(data.players).map(p => [p.id, p.name, p.level, p.score, p.attacks, p.teamId,
                 p.source === "torn" ? 1 : 0, p.updatedAt,
                 p.status ? [p.status.state, p.status.description, p.status.until] : null,
@@ -2990,12 +3095,12 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             .slice(offset, offset + 100).map(p => p.id);
     }
 
-    async function directoryRequest(teamId, offset, scanning = false) {
-        if (directory.busy || runtime.busy && scanning || !competitionVisible() || runtime.storageError) return false;
+    async function directoryRequest(teamId, offset, scanning = false, force = false) {
+        if (directory.busy || runtime.busy && (scanning || force) || !competitionVisible() || runtime.storageError) return false;
         const key = activeApiKey();
         if (!key) { directory.notice = "A Public-access Torn key is needed for the official roster."; return false; }
         if (!await ensureTeamCatalog()) return false;
-        if (directory.busy || runtime.busy && scanning || !competitionVisible() || runtime.storageError) return false;
+        if (directory.busy || runtime.busy && (scanning || force) || !competitionVisible() || runtime.storageError) return false;
         const catalogTeam = directory.catalog.teams.find(t => t.id === teamId);
         if (!teamIsActive(catalogTeam)) {
             directory.notice = "Inactive teams use their final cached roster and are not refreshed.";
@@ -3021,10 +3126,10 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             }
             const wait = REQUEST_GAP_MS - (Date.now() - directory.lastRequest);
             if (wait > 0) await sleep(wait);
-            if (runtime.busy && scanning || !competitionVisible() || generation !== directory.generation) return false;
+            if (runtime.busy && (scanning || force) || !competitionVisible() || generation !== directory.generation) return false;
             const response = await requestJson("/torn/" + teamId + "/eliminationteam", key,
                 { limit: 100, offset, timestamp: Math.floor(Date.now() / 1000) },
-                () => competitionVisible() && generation === directory.generation && (scanning ? !runtime.busy
+                () => competitionVisible() && generation === directory.generation && ((scanning || force) ? !runtime.busy
                     : String(teamId) === directory.team && offset === directory.offset));
             if (generation !== directory.generation) return false;
             acceptRosterPage(target, teamId, offset, response, Date.now(), scanning);
@@ -3074,6 +3179,32 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         }
     }
 
+    // Once a team drops to 2 lives it can be eliminated at any moment, and inactive teams
+    // stop refreshing entirely. Walk every page of that team's official roster (not just the
+    // currently viewed one) so the last attack/index snapshot before elimination is complete.
+    async function advanceFinalSnapshot(team) {
+        const d = directory.data;
+        if (!d) return false;
+        if (!d.finalSnapshots) d.finalSnapshots = {};
+        const state = d.finalSnapshots[team.id] || { offset: 0, done: false };
+        const ok = await directoryRequest(team.id, state.offset, false, true);
+        if (!ok) return false;
+        const page = directory.data.pages[team.id + ":" + state.offset];
+        if (!page) return false;
+        if (!directory.data.finalSnapshots) directory.data.finalSnapshots = {};
+        if (page.next === null) {
+            directory.data.finalSnapshots[team.id] = { offset: state.offset, done: true, completedAt: Date.now() };
+            const lives = number(team.lives);
+            directory.notice = "Final roster snapshot captured for " + team.name + " at "
+                + lives + " " + (lives === 1 ? "life" : "lives") + " remaining.";
+            await saveExtra(DIRECTORY_KEY, directory.data);
+            updateCompetitionContent();
+        } else {
+            directory.data.finalSnapshots[team.id] = { offset: page.next, done: false };
+        }
+        return true;
+    }
+
     async function competitionTick() {
         updateHospitalTimers();
         if (!competitionVisible()) return;
@@ -3091,6 +3222,12 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             && (directory.lastViewedPage !== pageKey || !visiblePage || Date.now() - visiblePage.updatedAt >= LIVE_PAGE_MS)) {
             await directoryRequest(Number(directory.team), directory.offset);
             return;
+        }
+        // A team at 2 lives or fewer can be eliminated any moment; capture every page of its
+        // roster as a final snapshot before that happens, ahead of the routine initial scan.
+        if (!runtime.busy && d.officialOpen) {
+            const critical = d.teams.find(team => teamAtRisk(team) && d.finalSnapshots?.[team.id]?.done !== true);
+            if (critical) { await advanceFinalSnapshot(critical); return; }
         }
         // Seed identities have no trustworthy API offsets. The first official pass establishes them.
         if (!runtime.busy && !d.scan.done && !d.scan.paused && Date.now() >= d.scan.retryAt) {
@@ -3222,7 +3359,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
     }
 
     function boundedFFCache() {
-        for (const [kind, max] of [["stats", 2000], ["history", 50]]) {
+        // Stats are meant to be kept permanently; the cap only guards against unbounded storage growth.
+        for (const [kind, max] of [["stats", 5000], ["history", 50]]) {
             ff.cache[kind] = Object.fromEntries(Object.entries(ff.cache[kind])
                 .sort((a, b) => b[1].fetchedAt - a[1].fetchedAt).slice(0, max));
         }
@@ -3240,8 +3378,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         const token = directory.viewToken;
         const generation = ff.generation;
         const relevant = () => competitionVisible() && token === directory.viewToken && generation === ff.generation;
-        const ids = visibleCompetitionIds().filter(id => !ff.cache.stats[id]
-            || Date.now() - ff.cache.stats[id].fetchedAt >= 300000);
+        // Estimates are cached permanently once fetched; only ever-unseen IDs are requested.
+        const ids = visibleCompetitionIds().filter(id => !ff.cache.stats[id]);
         if (!ids.length) return;
         if (!ff.validated && !await validateFF(relevant)) return;
         if (!relevant()) return;
@@ -3564,7 +3702,7 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             + cpInput("minbs", "Minimum BS (numeric)", filters.minbs) + cpInput("maxbs", "Maximum BS (numeric)", filters.maxbs)
             + cpSelect("unknown", "Unknown estimates", [["yes", "Keep visible"], ["no", "Hide"]], filters.unknown ? "yes" : "no")
             + '<button type="submit">Apply filters</button></div></details></form><p class="tefr-cp-help">FF is relative to the FFScouter key owner, not win probability. '
-            + 'Only this page receives estimates; cached for five minutes.</p>'
+            + 'Only this page receives estimates; each estimate is cached permanently once fetched.</p>'
             + '<p class="tefr-cp-help">Status first: Okay → Hospitalized → Traveling → Other → Unknown. '
             + 'Selected sorting applies within each status group.</p>'
             + (directory.mode === "roster" && !directory.search ? '<div class="tefr-panel-heading"><button data-cp-action="prev"'
