@@ -233,27 +233,46 @@ test("hidden nonparticipants stay in snapshots without renumbering visible ranks
     assert.equal(config.participation, "all");
 });
 
-test("enrollment cutoff requires a successful final check and preserves late joiners", () => {
-    const deadline = Date.parse("2026-09-10T12:00:00Z");
-    assert.equal(api.ENROLLMENT_END_MS, deadline);
-    const waiting = { ...rankedMember(1, "Waiting", 0, 0, null), competitionCheckedAt: deadline - 1 };
-    assert.equal(api.memberNeedsRefresh(waiting, deadline - 1), true);
-    assert.equal(api.memberNeedsRefresh(waiting, deadline), true);
-    assert.equal(api.memberNeedsRefresh(waiting, deadline + 600000), true);
-    const confirmed = { ...waiting, competitionCheckedAt: deadline };
-    assert.equal(api.memberNeedsRefresh(confirmed, deadline), false);
-    assert.equal(api.memberNeedsRefresh(confirmed, deadline + 3600000, true), true);
-    const final = api.priorMember(rosterMember(1, "Updated name"), confirmed, "final");
+test("member refreshes are limited to active members on active teams", () => {
+    const asOf = Date.parse("2026-09-14T12:10:00Z");
+    const teams = api.activeTeamKeys([
+        { id: 7, name: "Loose Cannons", lives: 10, eliminated: false },
+        { id: 8, name: "APEX", lives: 10, eliminated: true },
+        { id: 9, name: "No Lives", lives: 0, eliminated: false }
+    ]);
+    const active = { ...rankedMember(1, "Active", 3, 1, 7), teamName: "Loose Cannons" };
+    assert.equal(api.memberNeedsRefresh(active, asOf, false, teams), true);
+    assert.equal(api.memberNeedsRefresh({ ...active, teamId: null }, asOf, true, teams), true);
+    assert.equal(api.memberNeedsRefresh({ ...active, teamId: 8, teamName: "APEX" }, asOf, true, teams), false);
+    assert.equal(api.memberNeedsRefresh({ ...active, teamId: 9, teamName: "No Lives" }, asOf, true, teams), false);
+    assert.equal(api.memberNeedsRefresh({ ...active, droppedOut: true }, asOf, true, teams), false);
+    const confirmed = { ...rankedMember(2, "Inactive", 0, 0, null), competitionCheckedAt: asOf };
+    assert.equal(api.memberNeedsRefresh(confirmed, asOf, false, teams), false);
+    assert.equal(api.memberNeedsRefresh(confirmed, asOf, true, teams), false);
+    assert.equal(api.memberNeedsRefresh(undefined, asOf, false, teams), true);
+    const final = api.priorMember(rosterMember(2, "Updated name"), confirmed, "final");
     assert.equal(final.name, "Updated name");
     assert.equal(final.availability, "final");
-    assert.equal(api.memberNeedsRefresh(final, deadline + 3600000), false);
-    assert.equal(api.memberNeedsRefresh({ ...confirmed, availability: "stale" }, deadline + 600000), true);
-    assert.equal(api.memberNeedsRefresh({ ...confirmed, availability: "unavailable" }, deadline + 600000), true);
-    assert.equal(api.memberNeedsRefresh({ ...confirmed, participating: true }, deadline + 600000), true);
-    assert.equal(api.memberNeedsRefresh(undefined, deadline + 600000), true);
-    assert.equal(api.memberNeedsRefresh(confirmed, Date.parse("2027-09-11T12:10:00Z")), true);
+    assert.equal(api.memberNeedsRefresh(final, asOf, true, teams), false);
     const failed = api.priorMember(rosterMember(2, "Unknown"), api.normalizeMember({ id: 2 }, null, "unavailable"));
     assert.equal(failed.availability, "unavailable");
+});
+
+test("official index scans only active teams and preserves eliminated-team cache", () => {
+    const data = api.newDirectory([
+        { id: 1, name: "Active Team", participants: 1, lives: 10, eliminated: false },
+        { id: 2, name: "Eliminated Team", participants: 1, eliminated: true }
+    ], Date.parse("2026-09-14T12:10:00Z"));
+    data.players = {
+        10: { id: 10, teamId: 1, source: "ultimata" },
+        20: { id: 20, teamId: 2, source: "torn" }
+    };
+    data.pages["1:0"] = { ids: [10], updatedAt: 1, next: null };
+    api.reconcileDirectoryCursor(data);
+    assert.equal(data.scan.done, true);
+    assert.equal(data.pages["2:0"], undefined);
+    assert.ok(data.players[10]);
+    assert.ok(data.players[20]);
 });
 
 test("numeric faction IDs are validated and deduplicated", () => {
@@ -544,14 +563,42 @@ test("dropout tracking reconstructs former participation and keeps peak attacks"
     assert.equal(result.formerTeamName, "Loose Cannons");
 });
 
+test("refresh skips the profile and faction members after their team becomes inactive", async () => {
+    let inactive = false;
+    const fixture = fixtureRuntime((endpoint) => {
+        if (endpoint === "/torn/elimination") return { elimination: [
+            { id: 7, name: "Loose Cannons", lives: inactive ? 0 : 10, eliminated: inactive },
+            { id: 8, name: "APEX", lives: 10, eliminated: false }
+        ] };
+        if (endpoint === "/user/basic") return { profile: { id: 1, name: "Owner" } };
+        if (endpoint === "/user/competition" || endpoint === "/user/2/competition") return {
+            competition: { name: "Elimination", team_id: 7, team: "Loose Cannons", score: 4, attacks: 3 }
+        };
+        if (endpoint === "/faction/members") return { members: [
+            rosterMember(1, "Owner"), rosterMember(2, "Teammate")
+        ] };
+        if (endpoint === "/faction/basic") return { basic: { id: 10, name: "Main" } };
+        if (endpoint === "/faction/44817/basic") return { basic: { id: 44817, name: "Sister" } };
+        if (endpoint === "/faction/44817/members") return { members: [] };
+        assert.fail("Unexpected endpoint: " + endpoint);
+    });
+    assert.equal(await fixture.refreshData("manual"), true);
+    inactive = true;
+    fixture.calls.length = 0;
+    assert.equal(await fixture.refreshData("manual"), true);
+    assert.equal(fixture.calls.some(call => call.endpoint === "/user/competition"), false);
+    assert.equal(fixture.calls.some(call => call.endpoint === "/user/2/competition"), false);
+    assert.equal(fixture.runtime.snapshot.members.find(member => member.id === 2).attacks, 3);
+});
+
 test("refresh integrates alliance rosters, faster pacing, withdrawals, and retained final records", async () => {
-    let closed = false, withdrawn = false, rosterFailure = false;
+    let withdrawn = false, rosterFailure = false;
     const ownRoster = Array.from({ length: 11 }, (_, index) => rosterMember(index + 1, "Main " + (index + 1)));
     const sisterRoster = [rosterMember(12, "LateJoiner"), rosterMember(13, "NeverJoins"), ownRoster[0]];
     const competition = (id) => ({
         competition: {
-            name: "Elimination", team_id: id === 13 || id === 12 && (!closed || withdrawn) ? null : 7,
-            team: id === 13 || id === 12 && (!closed || withdrawn) ? "Unknown" : "Loose Cannons",
+            name: "Elimination", team_id: id === 13 || id === 12 && withdrawn ? null : 7,
+            team: id === 13 || id === 12 && withdrawn ? "Unknown" : "Loose Cannons",
             score: id === 13 ? 0 : id, attacks: id === 12 && withdrawn ? 0 : 1
         }
     });
@@ -574,7 +621,7 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     assert.equal(await fixture.refreshData("scheduled"), true);
     assert.equal(runtime.snapshot.members.length, 13);
     assert.equal(runtime.snapshot.members.find((member) => member.id === 1).factionId, 10);
-    assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, false);
+    assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, true);
     assert.equal(Object.keys(runtime.history.points[0].members).length, 13);
     const calls = fixture.calls.filter((call) => /^\/user\/\d+\/competition$/.test(call.endpoint));
     assert.equal(calls.length, 12);
@@ -584,11 +631,10 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     assert.ok(calls[10].at - calls[9].at >= api.MEMBER_CHUNK_PAUSE_MS);
     assert.equal(fixture.waits.filter((ms) => ms === api.MEMBER_CHUNK_PAUSE_MS).length, 1);
 
-    closed = true;
     fixture.setNow("2026-09-10T12:10:00Z");
     assert.equal(await fixture.refreshData("scheduled"), true);
     assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, true);
-    assert.equal(runtime.snapshot.members.find((member) => member.id === 13).availability, "fresh");
+    assert.equal(runtime.snapshot.members.find((member) => member.id === 13).availability, "final");
     fixture.calls.length = 0;
     fixture.setNow("2026-09-10T13:10:00Z");
     withdrawn = true;
@@ -610,7 +656,8 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     fixture.calls.length = 0;
     rosterFailure = true;
     assert.equal(await fixture.refreshData("manual"), true);
-    assert.equal(fixture.calls.some((call) => call.endpoint === "/user/13/competition"), true);
+    assert.equal(fixture.calls.some((call) => call.endpoint === "/user/13/competition"), false);
+    assert.equal(fixture.calls.some((call) => call.endpoint === "/user/12/competition"), false);
     assert.equal(runtime.snapshot.members.length, 13);
     assert.equal(runtime.snapshot.members.find((member) => member.id === 12).rosterStale, true);
     assert.match(runtime.warning, /44817 roster unavailable/);

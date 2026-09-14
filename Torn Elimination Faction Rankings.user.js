@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Elimination Faction Rankings
 // @namespace    https://github.com/SharpSplinter/Torn-Event-Scripts
-// @version      1.5.4
+// @version      1.5.5
 // @description  Compact attack-based Elimination rankings, near-live Tickets and on-demand rosters. Public-access key only.
 // @author       sharpsplinter [351311]
 // @license      MIT
@@ -30,7 +30,7 @@
 })(function() {
     "use strict";
 
-    const VERSION = "1.5.4";
+    const VERSION = "1.5.5";
     const ELIMINATION_TEAM_COUNT = 12;
     const API_BASE = "https://api.torn.com/v2";
     const PDA_KEY_RAW = "###PDA-APIKEY###";
@@ -296,13 +296,31 @@
         return byName || left.id - right.id;
     }
 
-    function memberNeedsRefresh(previous, asOf, force = false) {
-        // Only the 2026 enrollment deadline has been confirmed.
-        if (force || !previous || new Date(asOf).getUTCFullYear() !== 2026
-            || previous.participating !== false) return true;
-        return asOf < ENROLLMENT_END_MS
-            || !["fresh", "final"].includes(previous.availability)
-            || number(previous.competitionCheckedAt) < ENROLLMENT_END_MS;
+    function activeTeamKeys(teams) {
+        const keys = new Set();
+        for (const team of teams || []) {
+            if (!teamIsActive(team)) continue;
+            keys.add(teamKey(team));
+            const name = normalizedTeamName(team?.name ?? team?.teamName);
+            if (name && !isNonParticipatingTeam(name)) keys.add("name:" + name);
+        }
+        return keys;
+    }
+
+    function teamIsActive(team) {
+        if (!team || team.eliminated) return false;
+        const lives = nullableNumber(team.lives);
+        return lives === null || lives > 0;
+    }
+
+    function memberNeedsRefresh(previous, asOf, force = false, activeTeams = null) {
+        if (!previous) return true;
+        if (!previous.participating || previous.droppedOut) return false;
+        if (activeTeams instanceof Set) {
+            const nameKey = "name:" + normalizedTeamName(previous.teamName);
+            if (!activeTeams.has(teamKey(previous)) && !activeTeams.has(nameKey)) return false;
+        }
+        return true;
     }
 
     function visibleMembers(members, showNonParticipants = false) {
@@ -1137,6 +1155,13 @@
         };
     }
 
+    function competitionResponseFromMember(member) {
+        return member?.participating ? { competition: {
+            name: "Elimination", team_id: member.teamId, team: member.teamName,
+            score: member.score, attacks: member.attacks
+        } } : { competition: null };
+    }
+
     function lastSuccessfulUpdateAt(snapshot, config) {
         return Math.max(number(snapshot?.completedAt), number(config?.lastSuccessfulUpdateAt));
     }
@@ -1202,11 +1227,25 @@
             runtime.scan.owner = runtime.sessionId;
             runtime.scan.leaseUntil = Date.now() + 60000;
             await persistValues({ [SCAN_KEY]: runtime.scan });
+            const standings = await Promise.allSettled([
+                requestWithRetry("/torn/elimination", key, params)
+            ]).then(results => results[0]);
+            const knownTeams = standings.status === "fulfilled"
+                && Array.isArray(standings.value?.elimination)
+                ? standings.value.elimination : runtime.snapshot?.teams || [];
+            const previousProfileId = number(runtime.snapshot?.profile?.id);
+            const previousPersonal = (runtime.snapshot?.members || [])
+                .find(member => member.id === previousProfileId);
+            const refreshPersonal = memberNeedsRefresh(previousPersonal,
+                timestamp * 1000, reason === "manual", activeTeamKeys(knownTeams));
             const requests = await Promise.allSettled([
                 requestWithRetry("/user/basic", key, params),
-                requestWithRetry("/user/competition", key, params),
+                refreshPersonal
+                    ? requestWithRetry("/user/competition", key, params)
+                    : Promise.resolve(competitionResponseFromMember(previousPersonal)),
                 requestWithRetry("/faction/members", key, { ...params, strip_tags: true }),
-                requestWithRetry("/torn/elimination", key, params),
+                standings.status === "fulfilled"
+                    ? Promise.resolve(standings.value) : Promise.reject(standings.reason),
                 requestWithRetry("/faction/basic", key, params)
             ]);
             const stopped = requests.find(result => result.status === "rejected" && (result.reason?.paused || runtime.storageError));
@@ -1224,8 +1263,9 @@
                 && Array.isArray(requests[3].value?.elimination)
                 ? requests[3].value.elimination : [];
             if (globalTeams.length) await saveTeamCatalog(globalTeams);
-            const eventActive = personal.active
-                || globalTeams.some((team) => !team.eliminated);
+            const eventActive = globalTeams.length
+                ? globalTeams.some(teamIsActive)
+                : knownTeams.some(teamIsActive) || personal.active;
             if (!eventActive) {
                 runtime.config.lastCheckedSlot = slot;
                 runtime.config.lastCheckedFactionIds = alliedIds.join(",");
@@ -1262,13 +1302,17 @@
             const previousById = new Map(
                 (priorSnapshot?.members || []).map((member) => [String(member.id), member])
             );
+            const refreshTeamSource = globalTeams.length
+                ? globalTeams : priorSnapshot?.teams || [];
+            const refreshableTeams = activeTeamKeys(refreshTeamSource);
             const historicalParticipation = runtime.history.eventKey === keyForEvent
                 ? participationHistoryById(runtime.history) : new Map();
             const normalized = [];
             const otherMembers = [];
             roster.filter((member) => number(member.id) !== profile.id).forEach((member) => {
                 const previous = previousById.get(String(member.id));
-                if (memberNeedsRefresh(previous, timestamp * 1000, reason === "manual")) {
+                if (memberNeedsRefresh(previous, timestamp * 1000,
+                    reason === "manual", refreshableTeams)) {
                     otherMembers.push(member);
                 } else {
                     const retained = priorMember(member, previous, "final");
@@ -1281,7 +1325,7 @@
                 queued: otherMembers.length, retainedMembers,
                 currentlyParticipating: otherMembers.filter((member) =>
                     previousById.get(String(member.id))?.participating).length,
-                enrollmentEnds: formatUtc(ENROLLMENT_END_MS)
+                activeTeams: refreshTeamSource.filter(teamIsActive).length
             });
             const total = otherMembers.length;
             const chunkTotal = Math.ceil(total / MEMBER_CHUNK_SIZE);
@@ -1671,7 +1715,11 @@
                     wins: t.wins, losses: t.losses, eliminated: t.eliminated,
                     eliminated_timestamp: t.eliminated_timestamp })) };
             await persistValues({ [LIVE_TEAMS_KEY]: liveTeams.data });
-            if (!directory.catalog || eventKey(Date.now(), directory.catalog.teams) !== eventKey(Date.now(), result.elimination))
+            const activityChanged = !Array.isArray(directory.catalog?.teams) || result.elimination.some(team =>
+                teamIsActive(directory.catalog.teams.find(saved => saved.id === team.id))
+                    !== teamIsActive(team));
+            if (activityChanged
+                || eventKey(Date.now(), directory.catalog.teams) !== eventKey(Date.now(), result.elimination))
                 await saveTeamCatalog(result.elimination);
             liveTeams.notice = "";
             return true;
@@ -2418,7 +2466,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         teams = [...teams].sort((a, b) => a.id - b.id);
         const year = new Date(now).getUTCFullYear();
         const data = { schema: 2, eventKey: eventKey(now, teams), teams: teams.map(t => ({
-            id: t.id, name: t.name, participants: t.participants ?? t.rows?.length ?? 0
+            id: t.id, name: t.name, participants: t.participants ?? t.rows?.length ?? 0,
+            eliminated: Boolean(t.eliminated), lives: nullableNumber(t.lives)
         })), players: {}, pages: {}, officialOpen: false, completedAt: 0,
         scan: { team: 0, offset: 0, pages: 0, paused: false, retryAt: 0, done: false } };
         if (year === COMPETITION_SEED.year) {
@@ -2513,6 +2562,7 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         data.teams.sort((a, b) => a.id - b.id);
         data.scan.pages = Object.keys(data.pages).length;
         for (let i = 0; i < data.teams.length; i++) {
+            if (!teamIsActive(data.teams[i])) continue;
             let offset = 0;
             const visited = new Set();
             while (!visited.has(offset)) {
@@ -2527,7 +2577,9 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             }
         }
         const seen = new Set(Object.values(data.pages).flatMap(page => page.ids));
-        data.players = Object.fromEntries(Object.entries(data.players).filter(([id]) => seen.has(Number(id))));
+        const activeIds = new Set(data.teams.filter(teamIsActive).map(team => team.id));
+        data.players = Object.fromEntries(Object.entries(data.players).filter(([id, player]) =>
+            !activeIds.has(player.teamId) || seen.has(Number(id))));
         data.scan.done = true;
         data.scan.team = data.teams.length;
         data.scan.offset = 0;
@@ -2536,7 +2588,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
 
     async function saveTeamCatalog(teams) {
         const clean = teams.filter(t => Number.isSafeInteger(t.id) && t.id > 0 && !isNonParticipatingTeam(t.name))
-            .map(t => ({ id: t.id, name: String(t.name), participants: number(t.participants) })).sort((a, b) => a.id - b.id);
+            .map(t => ({ id: t.id, name: String(t.name), participants: number(t.participants),
+                lives: nullableNumber(t.lives), eliminated: Boolean(t.eliminated) })).sort((a, b) => a.id - b.id);
         if (clean.length !== ELIMINATION_TEAM_COUNT || new Set(clean.map(t => t.id)).size !== clean.length) return false;
         directory.catalog = { year: new Date().getUTCFullYear(), updatedAt: Date.now(), teams: clean };
         await persistValues({ [CATALOG_KEY]: directory.catalog });
@@ -2546,6 +2599,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
 
     async function ensureTeamCatalog() {
         if (directory.catalog?.year === new Date().getUTCFullYear()
+            && Array.isArray(directory.catalog.teams)
+            && directory.catalog.teams.every(team => typeof team.eliminated === "boolean")
             && Date.now() - directory.catalog.updatedAt < 86400000) return true;
         directory.busy = true;
         try {
@@ -2619,7 +2674,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         const verified = directory.catalog?.year === new Date().getUTCFullYear() ? directory.catalog.teams : null;
         const global = verified || (runtime.snapshot?.globalTeamsAvailable
             ? runtime.snapshot.teams.filter(t => t.id > 0).map(t => ({
-                id: t.id, name: t.name, participants: t.participants
+                id: t.id, name: t.name, participants: t.participants,
+                lives: t.lives, eliminated: t.eliminated
             })) : []);
         const year = new Date().getUTCFullYear();
         const teams = [...(global.length && (verified || new Date(runtime.snapshot.completedAt).getUTCFullYear() === year)
@@ -2685,7 +2741,12 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         if (!key) { directory.notice = "A Public-access Torn key is needed for the official roster."; return false; }
         if (!await ensureTeamCatalog()) return false;
         if (directory.busy || runtime.busy && scanning || !competitionVisible() || runtime.storageError) return false;
-        if (!directory.catalog.teams.some(t => t.id === teamId)) return false;
+        const catalogTeam = directory.catalog.teams.find(t => t.id === teamId);
+        if (!teamIsActive(catalogTeam)) {
+            directory.notice = "Inactive teams use their final cached roster and are not refreshed.";
+            updateCompetitionContent();
+            return false;
+        }
         directory.busy = true;
         const generation = directory.generation;
         let target = directory.data, leaseOwned = false;
@@ -2769,7 +2830,9 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         const d = directory.data;
         const pageKey = directory.team + ":" + directory.offset;
         const visiblePage = d.pages[directory.team + ":" + directory.offset];
+        const selectedTeamActive = teamIsActive(d.teams.find(team => String(team.id) === directory.team));
         if (directory.mode === "roster" && !directory.search
+            && selectedTeamActive
             && (directory.lastViewedPage !== pageKey || !visiblePage || Date.now() - visiblePage.updatedAt >= LIVE_PAGE_MS)) {
             await directoryRequest(Number(directory.team), directory.offset);
             return;
@@ -2780,7 +2843,7 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             if (team) await directoryRequest(team.id, d.scan.offset, true);
         } else if (directory.mode === "roster" && !directory.search) {
             const p = d.pages[directory.team + ":" + directory.offset];
-            if (d.officialOpen && (!p || Date.now() - p.updatedAt >= LIVE_PAGE_MS))
+            if (selectedTeamActive && d.officialOpen && (!p || Date.now() - p.updatedAt >= LIVE_PAGE_MS))
                 await directoryRequest(Number(directory.team), directory.offset);
         }
         if (competitionVisible()) void refreshVisibleEstimates();
@@ -3183,7 +3246,9 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
     function competitionView() {
         if (!directory.loaded) return '<div class="tefr-empty">Loading competition cache…</div>';
         const d = directory.data;
-        const teams = d.teams.map(t => [t.id, t.name + " (" + t.participants + ")"]);
+        const selectedTeam = d.teams.find(team => String(team.id) === directory.team);
+        const teams = d.teams.map(t => [t.id, t.name + " (" + t.participants + ")"
+            + (!teamIsActive(t) ? " · Inactive" : "")]);
         const filters = directory.filters;
         const progress = d.scan.done ? 100 : Math.min(99, Math.floor(100 * (d.scan.team
             + d.scan.offset / Math.max(100, d.teams[d.scan.team]?.participants || 100)) / Math.max(1, d.teams.length)));
@@ -3218,7 +3283,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
             + d.scan.pages + ' official pages</p><p data-cp-notice>' + escapeHtml(directory.notice) + '</p>'
             + '<div class="tefr-panel-heading"><button data-cp-action="pause">' + (d.scan.paused ? "Resume index" : "Pause index")
             + '</button><button data-cp-action="rebuild">Rebuild official index</button>'
-            + '<button data-cp-action="refresh">Refresh roster page</button></div></details><p data-ff-notice>' + escapeHtml(ff.notice)
+            + '<button data-cp-action="refresh"' + (!teamIsActive(selectedTeam) ? " disabled" : "")
+            + '>Refresh roster page</button></div></details><p data-ff-notice>' + escapeHtml(ff.notice)
             + '</p><div class="tefr-toolbar">' + cpSelect("team", "Elimination team", teams, directory.team)
             + cpInput("search", "Search entire cached directory (name / ID)", directory.search, "search")
             + '</div>' + (directory.mode === "finder" ? '<details class="tefr-cp-options"' + (!ff.finderAt ? ' open' : '')
@@ -3636,7 +3702,8 @@ ${MOBILE_CHROME.replaceAll("#tefr-root", "#tefr-root.is-pda")}
         ordinal, slotAtOrBefore, nextSlot,
         normalizeCompetition, normalizeMember, participationHistoryById, trackParticipation,
         memberPerformanceCompare,
-        memberNeedsRefresh, priorMember, visibleMembers, withNonParticipantVisibility,
+        teamIsActive, activeTeamKeys, memberNeedsRefresh, priorMember,
+        competitionResponseFromMember, visibleMembers, withNonParticipantVisibility,
         parseFactionIds, normalizeFaction, factionLabel, mergeFactionRosters,
         pointRank,
         normalizedTeamName, isNonParticipatingTeam, teamKey, resolveMemberTeams,
