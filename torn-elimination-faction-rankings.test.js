@@ -203,6 +203,15 @@ test("team aggregation keeps global and faction-only totals separate", () => {
     assert.equal(teams[0].factionAttacks, 5);
 });
 
+test("overview global team standings sort by lives before tickets", () => {
+    const sorted = api.sortGlobalTeamStandings([
+        { id: 1, name: "Ticket Leader", lives: 6, score: 9000, position: 1 },
+        { id: 2, name: "Life Leader", lives: 10, score: 1, position: 2 },
+        { id: 3, name: "Life Tie", lives: 10, score: 500, position: 3 }
+    ]);
+    assert.deepEqual(sorted.map((team) => team.id), [2, 3, 1]);
+});
+
 test("history replaces a repeated slot and resets for a new event key", () => {
     const first = { slot: 100, completedAt: 101, profileId: 1, teams: {}, members: {} };
     const replacement = { ...first, completedAt: 102 };
@@ -216,6 +225,27 @@ test("history replaces a repeated slot and resets for a new event key", () => {
     history = api.upsertHistory(history, "2027:3,4", { ...second, slot: 300 });
     assert.equal(history.points.length, 1);
     assert.equal(history.eventKey, "2027:3,4");
+});
+
+test("shared exporter snapshot contains only active and confirmed dropped participants", () => {
+    const active = { ...rankedMember(1, "Active", 10, 5, 7), factionId: 8317,
+        factionName: "Naughty Souls", factionTag: "$3xy", allianceRank: 1, factionRank: 1, teamRank: 1 };
+    const dropped = { ...rankedMember(2, "Dropped", 0, 3, null), factionId: 8317,
+        factionName: "Naughty Souls", factionTag: "$3xy", participating: false,
+        droppedOut: true, formerTeamName: "Loose Cannons", formerTeamId: 90,
+        allianceRank: 2, factionRank: 2 };
+    const inactive = { ...rankedMember(3, "Never Enrolled", 0, 0, null), factionId: 8317,
+        participating: false, droppedOut: false, allianceRank: 3, factionRank: 3 };
+    const payload = api.buildSharedExportSnapshot({
+        eventKey: "2026:70,90", scope: "1:44817", slot: 100, completedAt: 200,
+        factions: [{ id: 8317, name: "Naughty Souls", tag: "$3xy", own: true }],
+        teams: [], members: [active, dropped, inactive]
+    });
+    assert.equal(payload.sourceVersion, api.VERSION);
+    assert.deepEqual(payload.members.map((member) => member.id), [1, 2]);
+    assert.equal(payload.members[1].status, "dropped");
+    assert.equal(payload.members[1].teamName, "Loose Cannons");
+    assert.equal(JSON.stringify(payload).includes("ApiKey"), false);
 });
 
 test("hidden nonparticipants stay in snapshots without renumbering visible ranks", () => {
@@ -306,6 +336,17 @@ test("alliance and faction ranks are separate; duplicates and stale rosters do n
     assert.equal(api.pointRank(history, 1, "faction"), 1);
     assert.equal(history.members["1"][6], 10);
     assert.match(api.factionLabel(ranked[0]), /\[S\] Sister/);
+});
+
+test("current faction rosters deduplicate to the exact 99 plus 78 member scope", () => {
+    const souls = api.normalizeFaction({ id: 8317, name: "Naughty Souls", tag: "$3xy" }, null, true);
+    const sanctuary = api.normalizeFaction({ id: 44817, name: "Naughty Sanctuary", tag: "NaSa" });
+    const own = Array.from({ length: 99 }, (_, index) => rosterMember(index + 1, "Soul " + index));
+    const allied = Array.from({ length: 78 }, (_, index) => rosterMember(index + 1000, "Sanctuary " + index));
+    assert.equal(api.mergeFactionRosters([
+        { faction: souls, stale: false, members: own },
+        { faction: sanctuary, stale: false, members: allied }
+    ]).length, 177);
 });
 
 test("userscript security and TornPDA compatibility invariants", () => {
@@ -591,6 +632,40 @@ test("refresh skips the profile and faction members after their team becomes ina
     assert.equal(fixture.runtime.snapshot.members.find(member => member.id === 2).attacks, 3);
 });
 
+test("confirmed 2026 dropout seed converges fresh installs without adding roster members", () => {
+    const afterEnrollment = Date.parse("2026-09-12T05:00:00Z");
+    const known = [
+        [3583932, 8317, "Loose Cannons", 19],
+        [3676010, 44817, "Rocket Scientists", 0],
+        [2911255, 44817, "Reptilians", 0],
+        [959585, 8317, "Sticks and Stones", 0],
+        [4093649, 8317, "Loose Cannons", 0],
+        [3952272, 44817, "Nine Lives", 0],
+        [3942933, 8317, "High Voltage", 0],
+        [3485404, 8317, "Gold Dust", 0]
+    ];
+    for (const [id, factionId, teamName, attacks] of known) {
+        const evidence = api.knownDropoutHistory({ id, faction: { id: factionId } }, afterEnrollment);
+        assert.equal(evidence.teamName, teamName);
+        assert.equal(evidence.attacks, attacks);
+    }
+    assert.equal(api.knownDropoutHistory({ id: 3583932, faction: { id: 44817 } }, afterEnrollment), null);
+    assert.equal(api.knownDropoutHistory({ id: 3583932, faction: { id: 8317 } }, api.ENROLLMENT_END_MS - 1), null);
+    assert.equal(api.knownDropoutHistory({ id: 9999999, faction: { id: 8317 } }, afterEnrollment), null);
+});
+
+test("confirmed dropouts never require another player competition API call", () => {
+    const confirmed = {
+        participating: false,
+        droppedOut: true,
+        availability: "final",
+        competitionCheckedAt: Date.parse("2026-09-12T05:00:00Z")
+    };
+    const later = Date.parse("2026-09-12T06:00:00Z");
+    assert.equal(api.memberNeedsRefresh(confirmed, later), false);
+    assert.equal(api.memberNeedsRefresh(confirmed, later, true), false);
+});
+
 test("refresh integrates alliance rosters, faster pacing, withdrawals, and retained final records", async () => {
     let withdrawn = false, rosterFailure = false;
     const ownRoster = Array.from({ length: 11 }, (_, index) => rosterMember(index + 1, "Main " + (index + 1)));
@@ -620,6 +695,7 @@ test("refresh integrates alliance rosters, faster pacing, withdrawals, and retai
     assert.equal(runtime.config.alliedFactionIds[0], 44817);
     assert.equal(await fixture.refreshData("scheduled"), true);
     assert.equal(runtime.snapshot.members.length, 13);
+    assert.deepEqual(Array.from(runtime.snapshot.factions, (faction) => faction.memberCount), [11, 2]);
     assert.equal(runtime.snapshot.members.find((member) => member.id === 1).factionId, 10);
     assert.equal(runtime.snapshot.members.find((member) => member.id === 12).participating, true);
     assert.equal(Object.keys(runtime.history.points[0].members).length, 13);

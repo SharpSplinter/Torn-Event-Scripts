@@ -7,7 +7,7 @@ const assert = require("node:assert/strict");
 const file = path.join(__dirname, "Torn Elimination Faction Rankings.user.js");
 const api = require(file);
 const now = Date.parse("2026-09-09T20:00:00Z");
-const team = { id: 90, name: "Loose Cannons", participants: 101 };
+const team = { id: 90, name: "Loose Cannons", participants: 101, lives: 10, eliminated: false };
 const row = (id, state = "Okay") => ({ id, name: "Player " + id, level: 50,
     score: id, attacks: 1, status: { state, until: now / 1000 + 120 },
     last_action: { status: "Online", timestamp: now / 1000 } });
@@ -144,9 +144,22 @@ test("official pages override seed and retire unmatched rows only after full sca
     assert.equal(d.pages["90:100"].ids.length, 1);
 });
 
+test("official pagination follows the API offset even when a page is shorter than its limit", () => {
+    const d = api.newDirectory([team], now);
+    d.players = {};
+    const next = "https://api.torn.com/v2/torn/90/eliminationteam?limit=100&offset=100";
+    api.acceptRosterPage(d, 90, 0, page(Array.from({ length: 73 }, (_, i) => row(i + 1)), next), now, true);
+    assert.equal(d.scan.done, false);
+    assert.equal(d.scan.offset, 100);
+    api.acceptRosterPage(d, 90, 100, page([row(74)]), now, true);
+    assert.equal(d.scan.done, true);
+    assert.equal(Object.keys(d.players).length, 74);
+});
+
 test("pagination rejects malformed, foreign, repeated and wrong-team links atomically", () => {
     for (const next of ["https://evil.example/?offset=100", "/v2/torn/89/eliminationteam?offset=100",
-        "/v2/torn/90/eliminationteam?offset=0", "/v2/torn/90/eliminationteam?offset=no"]) {
+        "/v2/torn/90/eliminationteam?offset=0", "/v2/torn/90/eliminationteam?offset=no",
+        "/v2/torn/90/eliminationteam?offset=101"]) {
         const d = api.newDirectory([team], now);
         const before = JSON.stringify(d);
         assert.throws(() => api.acceptRosterPage(d, 90, 0, page([row(1)], next), now, true));
